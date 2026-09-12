@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
-import {settings,findCli,runCli,parseResult,act,sessionInfo,openBrowser,closeBrowser} from '../scripts/transport.mjs';
+import {settings,findCli,runCli,parseResult,act,sessionInfo,openBrowser,closeBrowser,recoverClosedBrowser} from '../scripts/transport.mjs';
 
 const scratch=fileURLToPath(new URL('../.work/transport-tests/',import.meta.url));
 await fs.mkdir(scratch,{recursive:true});
@@ -53,6 +53,49 @@ async function isolated(t) {
     t.after(()=>{if(previous===undefined)delete process.env[name];else process.env[name]=previous;});
   }
   return settings('fixture');
+}
+
+async function lostCloseResponseBackend(config){
+  const actual=require.resolve('@playwright/cli/playwright-cli.js');
+  const wrapper=path.join(config.base,'fault-backend.mjs'),flag=path.join(config.base,'drop-close-response');
+  const failList=path.join(config.base,'fail-list-once'),reply=path.join(config.base,'completed-close-reply.txt');
+  const calls=path.join(config.base,'backend-calls.jsonl');
+  await fs.mkdir(config.base,{recursive:true});
+  await fs.writeFile(wrapper,`
+import fs from 'node:fs/promises';
+import {spawn} from 'node:child_process';
+const args=process.argv.slice(2);
+await fs.appendFile(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');
+let fault;
+if(args[1]==='list'){
+  try{await fs.unlink(${JSON.stringify(failList)});fault='fail-list';}catch{}
+}
+if(fault==='fail-list'){
+  console.error('Synthetic recovery interruption');process.exitCode=7;
+}else{
+  if(args[1]==='run-code'){
+    const command=args.find(arg=>arg.startsWith('--filename='));
+    if(command&&(await fs.readFile(command.slice('--filename='.length),'utf8')).includes('"close-browser"')){
+      try{fault=await fs.readFile(${JSON.stringify(flag)},'utf8');await fs.unlink(${JSON.stringify(flag)});}catch{}
+    }
+  }
+  const child=spawn(process.execPath,[${JSON.stringify(actual)},...args],{cwd:process.cwd(),env:process.env,windowsHide:true,shell:false,stdio:['ignore','pipe','pipe']});
+  let stdout='',stderr='';
+  child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');
+  child.stdout.on('data',text=>stdout+=text);child.stderr.on('data',text=>stderr+=text);
+  child.on('error',error=>{console.error(error.message);process.exitCode=1;});
+  child.on('close',async code=>{
+    if(fault&&code===0){
+      await fs.writeFile(${JSON.stringify(reply)},stdout);
+      if(fault==='interrupt-recovery')await fs.writeFile(${JSON.stringify(failList)},'fail once');
+      process.stdout.write('### Page\\nSynthetic lost completed shutdown result\\n');
+    }else process.stdout.write(stdout);
+    process.stderr.write(stderr);process.exitCode=code;
+  });
+}
+`);
+  process.env.WA_PLAYWRIGHT_CLI=wrapper;
+  return {flag,reply,calls};
 }
 
 test('An explicit missing backend fails instead of falling through to another installation',async t=>{
@@ -172,6 +215,98 @@ test('The actual pinned CLI launches the detected Chrome and reopens only its is
     await closeBrowser(config);
     assert.equal((await sessionInfo(config)).open,false);
   }
+});
+
+test('A lost completed shutdown reply recovers the idle daemon and preserves its persistent cookie',async t=>{
+  const config=await isolated(t),fault=await lostCloseResponseBackend(config);
+  try{
+    await openBrowser(config,{url:'about:blank'});
+    await act(config,async page=>{
+      await page.context().addCookies([{name:'lost-reply',value:'synthetic-persistent-cookie',url:'https://transport.fixture.test',expires:Math.floor(Date.now()/1000)+3600}]);
+      return {saved:true};
+    },'fixture');
+    await fs.writeFile(fault.flag,'drop-result');
+    assert.deepEqual(await closeBrowser(config),{closed:true,profileRetained:true});
+    assert.deepEqual(parseResult(await fs.readFile(fault.reply,'utf8')).value,{browserClosed:true});
+    assert.equal((await sessionInfo(config)).open,false);
+    await assert.rejects(fs.access(path.join(config.cwd,'.wa-close-completed.json')),{code:'ENOENT'});
+    await openBrowser(config,{url:'about:blank'});
+    const cookies=await act(config,async page=>page.context().cookies('https://transport.fixture.test'),'fixture');
+    assert.equal(cookies.find(cookie=>cookie.name==='lost-reply')?.value,'synthetic-persistent-cookie');
+  }finally{
+    await fs.rm(fault.flag,{force:true});
+    await closeBrowser(config);
+    assert.equal((await sessionInfo(config)).open,false);
+  }
+});
+
+test('Interrupted shutdown recovery needs no page and an old receipt cannot stop a new daemon for the same profile',async t=>{
+  const config=await isolated(t),fault=await lostCloseResponseBackend(config);
+  const receiptFile=path.join(config.cwd,'.wa-close-completed.json');
+  try{
+    await openBrowser(config,{url:'about:blank'});
+    await fs.writeFile(fault.flag,'interrupt-recovery');
+    await assert.rejects(closeBrowser(config),{code:'BROWSER_ERROR',message:'Synthetic recovery interruption\n'});
+    assert.deepEqual(parseResult(await fs.readFile(fault.reply,'utf8')).value,{browserClosed:true});
+    const receipt=await fs.readFile(receiptFile,'utf8');
+    assert.equal((await sessionInfo(config)).open,true,'The closed browser leaves an idle daemon until recovery resumes.');
+    const callsBefore=(await fs.readFile(fault.calls,'utf8')).trim().split('\n').length;
+    assert.equal(await recoverClosedBrowser(config),true);
+    const recoveryCalls=(await fs.readFile(fault.calls,'utf8')).trim().split('\n').slice(callsBefore).map(line=>JSON.parse(line)[1]);
+    assert.ok(recoveryCalls.includes('close'));
+    assert.equal(recoveryCalls.includes('run-code'),false,'Recovery must work without a browser page.');
+    assert.equal((await sessionInfo(config)).open,false);
+    await assert.rejects(fs.access(receiptFile),{code:'ENOENT'});
+    await openBrowser(config,{url:'about:blank'});
+    await fs.writeFile(receiptFile,receipt);
+    assert.equal(await recoverClosedBrowser(config),false,'A new registration invalidates completion evidence from the previous daemon.');
+    assert.equal(await fs.readFile(receiptFile,'utf8'),receipt);
+    assert.equal((await sessionInfo(config)).open,true);
+    assert.equal(await act(config,async page=>page.url(),'fixture'),'about:blank');
+  }finally{
+    await fs.rm(fault.flag,{force:true});
+    await closeBrowser(config);
+    assert.equal((await sessionInfo(config)).open,false);
+  }
+});
+
+test('Recovery is a no-op for missing, unrelated or unregistered completion evidence',async t=>{
+  const config=await isolated(t),receiptFile=path.join(config.cwd,'.wa-close-completed.json');
+  const identity={registryFile:path.join(config.base,'synthetic.session'),instance:'a'.repeat(64)};
+  const receipt={schemaVersion:1,browserClosed:true,session:config.session,profile:config.profile,...identity,nonce:'00000000-0000-4000-8000-000000000000'};
+  const unexpected=async()=>assert.fail('Recovery must not use unrelated or incomplete evidence.');
+  assert.equal(await recoverClosedBrowser(config,{info:unexpected,stop:unexpected}),false);
+  await fs.mkdir(config.cwd,{recursive:true});
+  for(const unrelated of [{...receipt,session:'another-session'},{...receipt,profile:path.join(config.base,'another-profile')}]){
+    await fs.writeFile(receiptFile,JSON.stringify(unrelated));
+    assert.equal(await recoverClosedBrowser(config,{info:unexpected,stop:unexpected}),false);
+  }
+  await fs.writeFile(receiptFile,JSON.stringify(receipt));
+  assert.equal(await recoverClosedBrowser(config,{info:async()=>({open:true,profile:path.join(config.base,'another-profile')}),identity:unexpected,stop:unexpected}),false);
+  assert.equal(await recoverClosedBrowser(config,{info:async()=>({open:true,profile:config.profile}),
+    identity:async()=>{throw Object.assign(Error('Missing registration'),{code:'ENOENT'});},stop:unexpected}),false);
+  assert.equal(await recoverClosedBrowser(config,{info:async()=>({open:true,profile:config.profile}),
+    identity:async()=>({...identity,instance:'b'.repeat(64)}),stop:unexpected}),false);
+  assert.equal(await fs.readFile(receiptFile,'utf8'),JSON.stringify(receipt));
+});
+
+test('Recovery waits for the acknowledged idle daemon to exit without issuing another stop',async t=>{
+  const config=await isolated(t),receiptFile=path.join(config.cwd,'.wa-close-completed.json');
+  const identity={registryFile:path.join(config.base,'synthetic.session'),instance:'a'.repeat(64)};
+  const receipt={schemaVersion:1,browserClosed:true,session:config.session,profile:config.profile,...identity,nonce:'00000000-0000-4000-8000-000000000000'};
+  await fs.mkdir(config.cwd,{recursive:true});await fs.writeFile(receiptFile,JSON.stringify(receipt));
+  let observations=0,stops=0,sleeps=0,clock=0;
+  const dependencies={info:async()=>({open:++observations<4,profile:config.profile}),identity:async()=>identity,
+    stop:async()=>{stops++;},sleep:async()=>{sleeps++;clock+=100;},now:()=>clock};
+  assert.equal(await recoverClosedBrowser(config,dependencies),true);
+  assert.equal(stops,1);assert.equal(sleeps,2);
+  await assert.rejects(fs.access(receiptFile),{code:'ENOENT'});
+  await fs.writeFile(receiptFile,JSON.stringify(receipt));
+  stops=0;
+  await assert.rejects(recoverClosedBrowser(config,{...dependencies,info:async()=>({open:true,profile:config.profile}),
+    sleep:async()=>{clock+=10000;}}),{code:'BROWSER_CLOSE_PENDING'});
+  assert.equal(stops,1);
+  assert.equal(await fs.readFile(receiptFile,'utf8'),JSON.stringify(receipt));
 });
 
 test('Shutdown refuses another profile and accepts a confirmed close after a disconnected reply',async t=>{

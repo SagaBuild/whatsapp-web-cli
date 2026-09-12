@@ -40,7 +40,7 @@ For a visible window, finish or deliberately discard any pending attachment prev
 | macOS | `~/Library/Application Support/codex-whatsapp-web` |
 | Linux | `$XDG_DATA_HOME/codex-whatsapp-web` or `~/.local/share/codex-whatsapp-web` |
 
-`WA_DATA_DIR` overrides that directory and must be absolute. Changing it or selecting a new `--session` uses a different profile and may require linking again. Do not change either to fix ordinary loading errors. Do not put account data in a repository, shared profile, cloud-sync folder or CI secret.
+`WA_DATA_DIR` overrides that directory and must be absolute. On Windows, use a fully qualified drive or UNC path such as `C:\WhatsAppData` or `\\server\share\WhatsAppData`; paths such as `\WhatsAppData` depend on the current drive and are rejected. The same rule applies to `WA_CHROME_PATH`. Changing the data directory or selecting a new `--session` uses a different profile and may require linking again. Do not change either to fix ordinary loading errors. Do not put account data in a repository, shared profile, cloud-sync folder or CI secret.
 
 ## Recovery
 
@@ -53,6 +53,7 @@ For a visible window, finish or deliberately discard any pending attachment prev
 | `login_pending` | Finish linking in the open Chrome window, then rerun setup. |
 | `loading` | Let WhatsApp load and check your connection; retain the profile. |
 | `SESSION_CLOSED` | Run `open`. |
+| `BROWSER_CLOSE_PENDING` | Keep the profile intact and retry `close`. If Chrome already completed shutdown, `close`, `open` and setup can recover its private completion receipt. If the error persists, inspect the browser before restarting anything. |
 | `BROWSER_MODE` | Finish pending previews, then run `close` and `open --headed` to show a window. |
 | `BUSY` | Let the other command finish; inspect a stale lock before changing it. |
 | `FILE_CHOOSER_PENDING` | Complete or cancel the existing chooser. |
@@ -63,6 +64,8 @@ If WhatsApp explicitly shows a login screen again, check **Linked devices** on y
 
 ## Update or remove
 
-Update the source, run `npm ci --ignore-scripts`, then `npm run setup`. Code is copied from an explicit inventory. Changed browser dependencies cause the managed browser to close before updating; account storage is retained. Ordinary code updates reuse existing dependencies.
+Update the source, run `npm ci --ignore-scripts`, then `npm run setup`. Code is copied from an explicit inventory. Changed browser dependencies cause the managed browser to close before updating; account storage is retained. Ordinary code updates reuse verified existing dependencies. If dependency installation fails, rerun setup after fixing the reported error; the installer retries unfinished dependencies instead of treating the copied lockfile as a successful installation.
+
+An uncertain send recorded by an older version may lack the evidence needed for automatic confirmation. Inspect the chat and use the documented [send recovery commands](../references/commands.md) to record the outcome; updating does not authorize another send or clear the pending attempt.
 
 Removing the installed skill does not revoke the linked device or delete account data. Revoke the device separately through WhatsApp's **Linked devices** screen. Remove private local data only when you intend to discard that login and history cache.

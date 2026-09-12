@@ -170,11 +170,38 @@ export async function browserAction(page, op, a) {
   }
   const editor=()=>main.locator('footer [contenteditable="true"][role="textbox"]');
   const normalizeText=text=>text.replace(/\r\n?/g,'\n').replace(/\u00a0/g,' ').trim();
-  const filePreview=(name)=>page.getByRole('tab',{name:new RegExp('(?:^|,\\s*)'+name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'(?:,|$)')});
+  // Accessible-name matching normalizes whitespace. Parse the raw label with
+  // exact separators instead so commas and every filename space are preserved.
+  const filePreview=async(name,{wait=false}={})=>{
+    const deadline=Date.now()+(wait?10000:0);
+    for(;;){
+      const labels=await page.getByRole('tab').evaluateAll((tabs,filename)=>tabs.map(tab=>tab.getAttribute('aria-label')).filter(label=>{
+        const match=label?.match(/^(?:[Oo]pen document|[Åå]pne dokument), ([\s\S]+), (?:[Ii]tem|[Ee]lement) \d+(?: (?:of|av) \d+)?$/);
+        return match?.[1]===filename;
+      }),name);
+      if(labels.length){
+        const quote=value=>'"'+value.replace(/["\\\x00-\x1f\x7f]/g,character=>'\\'+character.codePointAt(0).toString(16)+' ')+'"';
+        const selector=[...new Set(labels)].map(label=>'[aria-label='+quote(label)+']').join(',');
+        return page.getByRole('tab').and(page.locator(selector));
+      }
+      if(Date.now()>=deadline)return page.locator(':not(*)');
+      await page.waitForTimeout(Math.min(100,deadline-Date.now()));
+    }
+  };
   const previewCount=async()=>{
     const send=page.getByRole('button',{name:/^(send \d+ selected|send \d+ valgte)$/i});
     if(await send.count()!==1||!await send.isVisible())return null;
     return Number((await send.getAttribute('aria-label')||await send.innerText()).match(/\b(\d+)\b/)?.[1]);
+  };
+  const assertNoCaption=async()=>{
+    // upload records files only. A caption, including emoji-only content, is a
+    // changed draft and must never be carried along with an authorized file send.
+    for(const input of await page.locator('[contenteditable="true"], textarea, input[role="textbox"], input:not([type]), input[type="text"]').all()){
+      if(await input.evaluate(e=>!!e.closest('#side, #pane-side')))continue;
+      const value=await input.evaluate(e=>'value' in e?e.value:null);
+      const text=value===null?(await input.evaluate(inspectRow)).messageText:value;
+      if(normalizeText(text))error('DRAFT_CHANGED','Attachment captions are not part of the prepared files. Clear the caption before verifying or sending this upload.');
+    }
   };
   const assertEmpty=async()=>{
     if(await page.getByRole('button',{name:/^(send \d+ selected|send \d+ valgte)$/i}).count())error('EXISTING_PREVIEW','An attachment preview is already open. Inspect or close it before preparing new files.');
@@ -205,9 +232,10 @@ export async function browserAction(page, op, a) {
     return {filesSet:true};
   }
   if(op==='verify-upload') {
-    if(!a.quick)for(const file of a.files)await filePreview(file.split(/[\\/]/).at(-1)).first().waitFor({state:'visible',timeout:10000});
+    if(!a.quick)for(const file of a.files)await filePreview(file.split(/[\\/]/).at(-1),{wait:true});
     if(await previewCount()!==a.files.length)error('NO_PREVIEW','Selected file count does not match the upload.');
-    for(const file of a.files){const preview=filePreview(file.split(/[\\/]/).at(-1));if(await preview.count()!==1||!await preview.isVisible())error('NO_PREVIEW','Upload preview filenames do not match.');}
+    for(const file of a.files){const preview=await filePreview(file.split(/[\\/]/).at(-1));if(await preview.count()!==1||!await preview.isVisible())error('NO_PREVIEW','Upload preview filenames do not match.');}
+    await assertNoCaption();
     await guard();
     return {chat:a.chat,status:'files_staged',files:a.files,sent:false,note:'Inspect ui snapshot before sending.'};
   }
@@ -216,9 +244,21 @@ export async function browserAction(page, op, a) {
     if(a.expected.kind==='text'&&(!a.expected.text||!normalizeText(a.expected.text)))error('DRAFT_MISMATCH','Prepared text is missing.');
     if(a.expected.kind==='files'&&(!Array.isArray(a.expected.names)||!a.expected.names.length||new Set(a.expected.names).size!==a.expected.names.length))error('DRAFT_MISMATCH','Prepared filenames are missing or ambiguous.');
   };
+  const captureBaseline=async()=>{
+    const before=(await read()).map(message=>message.id);
+    const scroller=main.locator('[data-testid="conversation-panel-messages"]');
+    const atLatest=await scroller.count()===1&&await scroller.evaluate(e=>e.clientHeight>0&&e.scrollHeight-e.scrollTop-e.clientHeight<=4);
+    return {before,confirmation:{version:1,anchorId:before.at(-1)||null,atLatest}};
+  };
   const matchingSent=after=>{
     const before=new Set(a.before||[]);
-    const added=after.filter(m=>!before.has(m.id)&&m.direction==='outgoing');
+    const confirmation=a.confirmation||a.expected.attempt?.confirmation;
+    // Newly loaded history also has IDs absent from `before`. Only rows after a
+    // recorded latest-edge anchor provide chronological evidence of a new send.
+    if(confirmation?.version!==1||confirmation.atLatest!==true||!confirmation.anchorId||!before.has(confirmation.anchorId))return [];
+    const anchors=after.map((message,index)=>message.id===confirmation.anchorId?index:-1).filter(index=>index>=0);
+    if(anchors.length!==1)return [];
+    const added=after.slice(anchors[0]+1).filter(m=>!before.has(m.id)&&m.direction==='outgoing');
     if(a.expected.kind==='text')return added.filter(m=>m.messageText===normalizeText(a.expected.text)).slice(0,1);
     const found=[];
     for(const name of a.expected.names){
@@ -233,7 +273,7 @@ export async function browserAction(page, op, a) {
     requireExpected();
     if(!Array.isArray(a.before))error('DRAFT_MISMATCH','No recorded send attempt to check.');
     const matches=matchingSent(await read());
-    return matches.length?sendResult(matches):{chat:a.chat,status:'send_unresolved',note:'No matching outgoing content is currently loaded. Inspect history/UI; this does not prove the send failed.'};
+    return matches.length?sendResult(matches):{chat:a.chat,status:'send_unresolved',note:'No matching outgoing content with reliable chronological evidence is currently loaded. Inspect history/UI; this does not prove the send failed.'};
   }
   if(op==='prepare-send'||op==='send') {
     if(a.authorized!==true) error('SEND_AUTHORIZATION','send requires --authorized and an explicit user request to send this content to this chat.');
@@ -246,10 +286,18 @@ export async function browserAction(page, op, a) {
       if(count!==null||await editor().count()!==1||!await editor().isVisible()||(await editor().evaluate(inspectRow)).messageText!==normalizeText(a.expected.text))error('DRAFT_CHANGED','The prepared text has changed or an attachment preview is open.');
     }else{
       if(a.expected.names.length!==count)error('DRAFT_CHANGED','Selected attachment count does not match the prepared files.');
-      for(const file of a.expected.names){const preview=filePreview(file);if(await preview.count()!==1||!await preview.isVisible())error('DRAFT_CHANGED','The prepared file preview has changed.');}
+      for(const file of a.expected.names){const preview=await filePreview(file);if(await preview.count()!==1||!await preview.isVisible())error('DRAFT_CHANGED','The prepared file preview has changed.');}
+      await assertNoCaption();
     }
-    a.before=(await read()).map(m=>m.id);
-    if(op==='prepare-send')return {before:a.before};
+    const baseline=await captureBaseline();
+    if(op==='prepare-send')return baseline;
+    if(a.expected.attempt){
+      if(!Array.isArray(a.expected.attempt.before))error('DRAFT_MISMATCH','The recorded send baseline is missing. Inspect the prepared draft before sending.');
+      a.before=a.expected.attempt.before;a.confirmation=a.expected.attempt.confirmation;
+      if(a.confirmation?.atLatest===true&&a.confirmation.anchorId&&(!baseline.confirmation.atLatest||baseline.confirmation.anchorId!==a.confirmation.anchorId)){
+        error('DRAFT_CHANGED','The latest conversation messages changed since send preparation. Inspect the chat and prepare the send again.');
+      }
+    }else{a.before=baseline.before;a.confirmation=baseline.confirmation;}
     await guard();
     try { await buttons.click({timeout:10000}); }
     catch { error('SEND_UNCERTAIN','Send may have been activated. Inspect the chat; do not automatically retry.'); }

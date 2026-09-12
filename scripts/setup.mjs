@@ -4,15 +4,16 @@ import {parseArgs} from 'node:util';
 import {setTimeout as delay} from 'node:timers/promises';
 import {installSkill} from './install.mjs';
 import {checkRequirements,samePath,isMain} from './platform.mjs';
-import {settings,findCli,sessionInfo,runCli,act,openBrowser,closeBrowser} from './transport.mjs';
+import {settings,findCli,sessionInfo,runCli,act,openBrowser,closeBrowser,recoverClosedBrowser} from './transport.mjs';
 import {browserAction} from './browser.mjs';
 import {fail,withLock} from './storage.mjs';
 
 export const linkInstructions='In WhatsApp on your phone, open Settings (iPhone) or the menu (Android), then Linked devices > Link a device. Scan the QR code in the official web.whatsapp.com Chrome window. Leave Stay logged in enabled if that option appears. Never paste the QR code, a login code or your browser profile into an issue or chat.';
 
-export async function openLoginWindow(config,backend={sessionInfo,runCli,act,openBrowser,closeBrowser}){
-  const {sessionInfo,runCli,act,openBrowser,closeBrowser}=backend;
+export async function openLoginWindow(config,backend={sessionInfo,runCli,act,openBrowser,closeBrowser,recoverClosedBrowser}){
+  const {sessionInfo,runCli,act,openBrowser,closeBrowser,recoverClosedBrowser}=backend;
   return withLock(config.lock,async()=>{
+    await recoverClosedBrowser?.(config);
     const info=await sessionInfo(config);
     if(info.open){
       if(!await samePath(info.profile,config.profile))throw fail('PROFILE_MISMATCH','The browser session uses another profile. Inspect its configuration before setup.');

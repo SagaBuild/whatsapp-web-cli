@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import { createRequire } from 'node:module';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fail } from './storage.mjs';
@@ -62,11 +63,93 @@ export async function openBrowser(config,{headed=false,url='https://web.whatsapp
   finally{if(!keep)await fs.rm(file,{force:true});}
 }
 
+const closeReceiptFile=config=>path.join(config.cwd,'.wa-close-completed.json');
+
+async function readCloseReceipt(config){
+  let receipt;
+  try{receipt=JSON.parse(await fs.readFile(closeReceiptFile(config),'utf8'));}
+  catch(error){if(error.code==='ENOENT')return null;throw fail('BROWSER_CLOSE_STATE','The private shutdown receipt is unreadable. Keep the profile intact and inspect the shutdown state.');}
+  if(receipt?.schemaVersion!==1||receipt.browserClosed!==true||receipt.session!==config.session||
+      typeof receipt.profile!=='string'||typeof receipt.registryFile!=='string'||
+      !/^[a-f0-9]{64}$/.test(receipt.instance||'')||!/^[-a-f0-9]{36}$/.test(receipt.nonce||''))return null;
+  return receipt;
+}
+
+async function daemonIdentity(config,info){
+  // The pinned CLI writes one registration per runtime workspace and session.
+  // Include file-generation metadata: a new daemon cannot reuse an old receipt
+  // even when it reopens the same profile, socket and session name.
+  const cache=process.platform==='win32'?(process.env.LOCALAPPDATA||path.join(os.homedir(),'AppData','Local'))
+    :process.platform==='darwin'?path.join(os.homedir(),'Library','Caches'):(process.env.XDG_CACHE_HOME||path.join(os.homedir(),'.cache'));
+  const registry=process.env.PWTEST_DAEMON_SESSION_DIR||path.join(cache,'ms-playwright','daemon');
+  const workspace=info.workspace||await fs.realpath(config.cwd);
+  if(!await samePath(workspace,config.cwd))throw fail('PROFILE_MISMATCH','The browser registry belongs to another runtime directory.');
+  const directory=createHash('sha1').update(workspace).digest('hex').slice(0,16);
+  const file=path.join(registry,directory,config.session+'.session');
+  let handle;
+  try{
+    handle=await fs.open(file,'r');
+    const before=await handle.stat({bigint:true}),text=await handle.readFile('utf8'),after=await handle.stat({bigint:true});
+    if(before.mtimeNs!==after.mtimeNs||before.ctimeNs!==after.ctimeNs||before.size!==after.size)throw fail('BROWSER_SESSION_CHANGED','The browser registration changed during inspection.');
+    const record=JSON.parse(text);
+    if(record.name!==config.session||!await samePath(record.browser?.userDataDir,config.profile)||
+        !await samePath(record.workspaceDir,config.cwd)||!Number.isSafeInteger(record.timestamp)||record.timestamp<=0||typeof record.socketPath!=='string')throw fail('PROFILE_MISMATCH','The browser registration does not match this session and profile.');
+    const generation=[after.dev,after.ino,after.birthtimeNs,after.mtimeNs,after.ctimeNs,after.size].map(String);
+    const instance=createHash('sha256').update(JSON.stringify({text,generation})).digest('hex');
+    return {registryFile:file,instance};
+  }finally{await handle?.close();}
+}
+
+// Supported callers hold this session's command lock through recovery and their
+// following open/close operation. An independently invoked raw backend must not
+// restart the same session between the identity check and the targeted stop.
+export async function recoverClosedBrowser(config,dependencies={}){
+  const receipt=await readCloseReceipt(config);
+  if(!receipt||!await samePath(receipt.profile,config.profile))return false;
+  const info=dependencies.info||sessionInfo,identity=dependencies.identity||daemonIdentity;
+  const current=await info(config);
+  if(!current.open||!await samePath(current.profile,config.profile))return false;
+  let actual;
+  try{actual=await identity(config,current);}catch(error){if(error.code==='ENOENT')return false;throw error;}
+  if(actual.instance!==receipt.instance||!await samePath(actual.registryFile,receipt.registryFile))return false;
+  // This receipt was written inside the exact registered daemon only after its
+  // browser fully closed. Stopping that idle daemon cannot interrupt a live one.
+  await (dependencies.stop||((c)=>runCli(c,['close'])))(config);
+  const now=dependencies.now||Date.now,sleep=dependencies.sleep||delay,deadline=now()+10000;
+  while((await info(config)).open){
+    if(now()>=deadline)throw fail('BROWSER_CLOSE_PENDING','The completed shutdown daemon is still registered. Keep the profile and retry recovery.');
+    // The pinned stop acknowledgment may arrive just before process exit. Only
+    // observe it here: never send a second stop to a possibly replaced daemon.
+    await sleep(100);
+  }
+  const latest=await readCloseReceipt(config);
+  if(latest?.nonce===receipt.nonce)await fs.rm(closeReceiptFile(config),{force:true});
+  return true;
+}
+
 export async function closeBrowser(config,dependencies={}){
   const info=dependencies.info||sessionInfo,sleep=dependencies.sleep||delay,now=dependencies.now||Date.now;
+  if(await recoverClosedBrowser(config,dependencies))return {closed:true,profileRetained:true};
   const request=dependencies.request||(async c=>{
-    await act(c,async page=>{
+    const identity=await daemonIdentity(c,await info(c));
+    const receipt={schemaVersion:1,browserClosed:true,session:c.session,profile:c.profile,...identity,nonce:randomUUID()};
+    await act(c,async (page,_operation,args)=>{
       const context=page.context();
+      // run-code is explicitly a Node-process API. Its VM has no import globals;
+      // resolve only Node builtins from the existing Playwright object's realm.
+      const host=context.constructor.constructor('return process')();
+      const builtin=name=>host.getBuiltinModule?host.getBuiltinModule(name):host.mainModule.require(name);
+      const filesystem=builtin('fs').promises,crypto=builtin('crypto');
+      const registration=async()=>{
+        const handle=await filesystem.open(args.receipt.registryFile,'r');
+        try{
+          const before=await handle.stat({bigint:true}),text=await handle.readFile('utf8'),after=await handle.stat({bigint:true});
+          if(before.mtimeNs!==after.mtimeNs||before.ctimeNs!==after.ctimeNs||before.size!==after.size)return null;
+          const generation=[after.dev,after.ino,after.birthtimeNs,after.mtimeNs,after.ctimeNs,after.size].map(String);
+          return crypto.createHash('sha256').update(JSON.stringify({text,generation})).digest('hex');
+        }finally{await handle.close();}
+      };
+      if(await registration()!==args.receipt.instance)throw Object.assign(Error('The browser registration changed before shutdown.'),{code:'BROWSER_SESSION_CHANGED'});
       // This exact listener belongs to the pinned Playwright CLI daemon. Keep all
       // other close listeners, including Playwright's own completion promise.
       const listeners=context.listeners('close').filter(listener=>{
@@ -77,10 +160,14 @@ export async function closeBrowser(config,dependencies={}){
       context.removeListener('close',listeners[0]);
       try{await context.close();}
       catch(error){context.on('close',listeners[0]);throw error;}
+      if(await registration()!==args.receipt.instance)throw Object.assign(Error('The browser registration changed during shutdown.'),{code:'BROWSER_SESSION_CHANGED'});
+      const temporary=args.receiptPath+'.'+args.receipt.nonce+'.tmp';
+      try{
+        await filesystem.writeFile(temporary,JSON.stringify({...args.receipt,completedAt:new Date().toISOString(),daemonPid:host.pid}),{flag:'wx',mode:0o600});
+        await filesystem.rename(temporary,args.receiptPath);
+      }finally{await filesystem.rm(temporary,{force:true});}
       return {browserClosed:true};
-    },'close-browser');
-    // Chrome has finished closing and flushing the profile; stop its idle daemon.
-    await runCli(c,['close']);
+    },'close-browser',{receipt,receiptPath:closeReceiptFile(c)});
   });
   const before=await info(config);
   if(!before.open)return {closed:true,profileRetained:true};
@@ -93,10 +180,11 @@ export async function closeBrowser(config,dependencies={}){
   // Confirm the result; never fall back to killing a browser with unflushed state.
   const deadline=now()+10000;
   do{
+    if(await recoverClosedBrowser(config,dependencies))return {closed:true,profileRetained:true};
     const current=await info(config);
     if(!current.open)return {closed:true,profileRetained:true};
     if(!await samePath(current.profile,config.profile))throw fail('PROFILE_MISMATCH','The browser profile changed during shutdown. Inspect it before continuing.');
-    if(error&&error.code!=='BROWSER_ERROR'&&error.code!=='COMMAND_TIMEOUT')throw error;
+    if(error&&!['BROWSER_ERROR','COMMAND_TIMEOUT','RESULT_MISSING','RESULT_INVALID'].includes(error.code))throw error;
     await sleep(100);
   }while(now()<deadline);
   throw fail('BROWSER_CLOSE_PENDING','Chrome has not confirmed shutdown. Leave its profile intact and inspect the browser before retrying.');
@@ -157,6 +245,7 @@ export async function sessionInfo(config) {
   if(matches.length!==1)throw fail('SESSION_AMBIGUOUS','The browser backend returned more than one matching session.');
   const browser=matches[0];
   return {open:browser.status==='open',known:true,profile:typeof browser.userDataDir==='string'?browser.userDataDir:undefined,
+    workspace:typeof browser.workspace==='string'?browser.workspace:undefined,
     headed:typeof browser.headed==='boolean'?browser.headed:undefined,
     compatible:browser.compatible,persistent:browser.persistent,attached:browser.attached};
 }

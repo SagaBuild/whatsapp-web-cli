@@ -34,7 +34,7 @@ node $wa ui snapshot
 node $wa send --chat 'Team chat' --authorized
 ```
 
-Compose and upload each require an empty normal composer. Send or deliberately clear an existing draft before starting another. Document upload preserves the original file; photos-as-media, captions, replies, reactions and other workflows can use the general UI commands where available.
+Compose and upload each require an empty normal composer. Send or deliberately clear an existing draft before starting another. Document upload preserves the original file and checks complete preview filenames. It prepares files without captions; any added caption must be cleared before upload verification or guarded send. Photos-as-media, captions, replies, reactions and other workflows can use the general UI commands where available, with explicit authorization for the full content.
 
 ```powershell
 node $wa ui snapshot
@@ -52,7 +52,7 @@ Use a fresh snapshot for references. `ui upload` can complete a guarded file cho
 
 Useful errors: `SESSION_CLOSED` → open; `LOGIN_REQUIRED` → inspect loading/login; `WRONG_CHAT` → reverify and select; `AMBIGUOUS_CHAT` → clarify identity; `MESSAGE_NOT_LOADED` → scroll/read; `EXISTING_DRAFT`/`EXISTING_PREVIEW`/`DRAFT_CHANGED` → inspect the prepared content; `DRAFT_NOT_PREPARED`/`STATE_INVALID` → inspect and deliberately prepare with compose/upload; `BUSY` → another command owns the session or its lock needs inspection; `DOWNLOAD_UNCONFIRMED`/`SEND_UNCERTAIN` → inspect the actual outcome before any retry.
 
-After `SEND_UNCERTAIN`, run `node $wa send-check --chat 'Team chat'`. This only reads matching new outgoing content and clears the attempt if confirmed. It never clicks Send. `send_unresolved` means no match is currently loaded; older history, reformatted text or UI changes can require manual inspection. `status` includes a pending attempt timestamp. Do not prepare another copy as an automatic retry.
+After `SEND_UNCERTAIN`, run `node $wa send-check --chat 'Team chat'`. This only reads matching outgoing content after the recorded latest chat position and clears the attempt if confirmed. It never clicks Send. Loading an older matching message cannot confirm the attempt. `send_unresolved` means the available evidence is insufficient: the recorded position may no longer be loaded, the attempt may have been recorded by a version without this evidence, or the chat may have had no readable messages before sending. Return to the latest messages and inspect the UI/history as needed. `status` includes a pending attempt timestamp. Do not prepare another copy as an automatic retry.
 
 While an attempt is unresolved, compose and upload are blocked across all chats. After actually inspecting the UI/history, record a manual conclusion with `node $wa send-resolve --chat 'Team chat' --outcome sent --inspected` (or `not-sent` if inspection establishes that). It writes a private receipt and clears preparation without browser access. It does not claim automated delivery verification, change the visible draft or authorize another send. Never resolve uncertainty just to get past the guard.
 

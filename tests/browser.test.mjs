@@ -200,9 +200,147 @@ test('A batch confirmation requires each exact filename, not multiple copies of 
 
 test('A delayed result can be checked without sending again',async()=>{
   const f=await fixture();try{
-    const expected={kind:'text',chat:'Team A',text:'Check result'},before=(await f.run('messages')).messages.map(m=>m.id);
-    assert.equal((await f.run('send-check',{expected,before})).status,'send_unresolved');
+    const expected={kind:'text',chat:'Team A',text:'Check result'};
+    await f.run('compose',{text:expected.text});
+    const {before,confirmation}=await f.run('prepare-send',{authorized:true,expected});
+    expected.attempt={at:new Date().toISOString(),before,confirmation};
+    assert.equal((await f.run('send-check',{expected,before,confirmation})).status,'send_unresolved');
     await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(e=>e.insertAdjacentHTML('beforeend','<div data-id="delayed" class="message-out"><span data-testid="selectable-text">Check result</span></div>'));
-    assert.equal((await f.run('send-check',{expected,before})).messages[0].messageId,'delayed');assert.equal(await f.page.evaluate(()=>window.sent),0);
+    assert.equal((await f.run('send-check',{expected,before,confirmation})).messages[0].messageId,'delayed');assert.equal(await f.page.evaluate(()=>window.sent),0);
+  }finally{await f.close();}
+});
+
+test('Preview validation compares the complete filename and preserves legitimate commas',async()=>{
+  const f=await fixture();try{
+    await f.page.evaluate(()=>previewFiles([{name:'draft, report[1].pdf'}]));
+    const wrong={kind:'files',chat:'Team A',names:['report[1].pdf']};
+    await assert.rejects(f.run('verify-upload',{files:wrong.names,quick:true}),{code:'NO_PREVIEW'});
+    await assert.rejects(f.run('prepare-send',{authorized:true,expected:wrong}),{code:'DRAFT_CHANGED'});
+    await assert.rejects(f.run('send',{authorized:true,expected:wrong}),{code:'DRAFT_CHANGED'});
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+    const expected={kind:'files',chat:'Team A',names:['draft, report[1].pdf']};
+    assert.equal((await f.run('verify-upload',{files:expected.names,quick:true})).status,'files_staged');
+    assert.equal((await f.run('send',{authorized:true,expected})).status,'outgoing_message_observed');
+    assert.equal(await f.page.evaluate(()=>window.sent),1);
+  }finally{await f.close();}
+});
+
+test('A filename cannot match only the preview action label or differ in case',async()=>{
+  const f=await fixture();try{
+    await f.page.evaluate(()=>previewFiles([{name:'report.pdf'}]));
+    for(const name of ['Open document, report.pdf, item 1','REPORT.pdf']){
+      await assert.rejects(f.run('verify-upload',{files:[name],quick:true}),{code:'NO_PREVIEW'});
+      await assert.rejects(f.run('send',{authorized:true,expected:{kind:'files',chat:'Team A',names:[name]}}),{code:'DRAFT_CHANGED'});
+    }
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+  }finally{await f.close();}
+});
+
+test('Raw preview filenames distinguish leading and repeated internal whitespace before Send',async()=>{
+  const f=await fixture();try{
+    for(const [actual,substitute] of [[' report.pdf','report.pdf'],['report  final.pdf','report final.pdf'],['report\u00a0final.pdf','report final.pdf']]){
+      await f.page.evaluate(name=>previewFiles([{name}]),actual);
+      const expected={kind:'files',chat:'Team A',names:[substitute]};
+      await assert.rejects(f.run('verify-upload',{files:expected.names,quick:true}),{code:'NO_PREVIEW'});
+      await assert.rejects(f.run('prepare-send',{authorized:true,expected}),{code:'DRAFT_CHANGED'});
+      await assert.rejects(f.run('send',{authorized:true,expected}),{code:'DRAFT_CHANGED'});
+      assert.equal(await f.page.evaluate(()=>window.sent),0);
+      assert.equal((await f.run('verify-upload',{files:[actual],quick:true})).status,'files_staged');
+      assert.ok((await f.run('prepare-send',{authorized:true,expected:{...expected,names:[actual]}})).before.length>0);
+    }
+  }finally{await f.close();}
+});
+
+test('Raw filename verification waits for a delayed preview and then sends the matching file',async()=>{
+  const f=await fixture();try{
+    const name='draft, report[1].pdf';
+    await f.page.evaluate(name=>setTimeout(()=>previewFiles([{name}]),200),name);
+    assert.equal((await f.run('verify-upload',{files:[name]})).status,'files_staged');
+    assert.equal((await f.run('send',{authorized:true,expected:{kind:'files',chat:'Team A',names:[name]}})).status,'outgoing_message_observed');
+    assert.equal(await f.page.evaluate(()=>window.sent),1);
+  }finally{await f.close();}
+});
+
+test('File sends reject added text, emoji, input and hidden captions before clicking Send',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'files',chat:'Team A',names:['report.pdf']};
+    for(const kind of ['text','emoji','input','hidden']){
+      await f.page.evaluate(kind=>{
+        previewFiles([{name:'report.pdf'}]);
+        const input=document.createElement(kind==='input'?'input':'div');input.id='caption';
+        if(kind==='input'){input.type='text';input.value='Unrequested caption';}
+        else{input.contentEditable='true';input.setAttribute('role','textbox');input.innerHTML=kind==='emoji'?'<img alt="✅">':'Unrequested caption';}
+        if(kind==='hidden')input.hidden=true;
+        document.querySelector('#preview').append(input);
+      },kind);
+      await assert.rejects(f.run('verify-upload',{files:expected.names,quick:true}),{code:'DRAFT_CHANGED'});
+      await assert.rejects(f.run('prepare-send',{authorized:true,expected}),{code:'DRAFT_CHANGED'});
+      await assert.rejects(f.run('send',{authorized:true,expected}),{code:'DRAFT_CHANGED'});
+      assert.equal(await f.page.evaluate(()=>window.sent),0);
+    }
+    await f.page.evaluate(()=>{
+      document.querySelector('#caption').remove();
+      const caption=document.createElement('div');caption.contentEditable='true';caption.setAttribute('role','textbox');caption.innerHTML='<br>';document.querySelector('#preview').append(caption);
+    });
+    await f.page.locator('#side input').fill('Team A');
+    assert.equal((await f.run('verify-upload',{files:expected.names,quick:true})).status,'files_staged');
+    assert.equal((await f.run('send',{authorized:true,expected})).status,'outgoing_message_observed');
+    assert.equal(await f.page.evaluate(()=>window.sent),1);
+  }finally{await f.close();}
+});
+
+test('Historical matching rows cannot confirm an attempt, including after its anchor is unloaded',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'text',chat:'Team A',text:'Repeated message'};
+    await f.run('compose',{text:expected.text});
+    const {before,confirmation}=await f.run('prepare-send',{authorized:true,expected});
+    assert.equal(confirmation.atLatest,true);assert.equal(confirmation.anchorId,'link1');
+    expected.attempt={at:'2026-09-12T12:00:00.000Z',before,confirmation};
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(e=>e.insertAdjacentHTML('afterbegin','<div data-id="old-history" class="message-out"><span data-pre-plain-text="[10:00, 1/1/2020] Test: "></span><span data-testid="selectable-text">Repeated message</span></div>'));
+    assert.equal((await f.run('send-check',{expected,before,confirmation})).status,'send_unresolved');
+    await f.page.locator('[data-id="link1"]').evaluate(e=>e.remove());
+    assert.equal((await f.run('send-check',{expected,before,confirmation})).status,'send_unresolved');
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+  }finally{await f.close();}
+});
+
+test('Legacy and incomplete chronological evidence cannot confirm a matching message',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'text',chat:'Team A',text:'Repeated message'},before=(await f.run('messages')).messages.map(message=>message.id);
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(e=>e.insertAdjacentHTML('beforeend','<div data-id="unknown-age" class="message-out"><span data-testid="selectable-text">Repeated message</span></div>'));
+    for(const confirmation of [undefined,{version:1,atLatest:false,anchorId:'link1'},{version:1,atLatest:true,anchorId:null},{version:1,atLatest:true,anchorId:'not-in-baseline'}]){
+      assert.equal((await f.run('send-check',{expected,before,confirmation})).status,'send_unresolved');
+    }
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+  }finally{await f.close();}
+});
+
+test('Preparing from older loaded history does not claim a latest-edge baseline',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'text',chat:'Team A',text:'Repeated message'};
+    await f.run('compose',{text:expected.text});
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(e=>{
+      e.insertAdjacentHTML('beforeend','<div style="height:1000px"></div>');e.scrollTop=0;
+    });
+    const {before,confirmation}=await f.run('prepare-send',{authorized:true,expected});
+    assert.equal(confirmation.atLatest,false);
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(e=>e.insertAdjacentHTML('beforeend','<div data-id="unknown-age" class="message-out"><span data-testid="selectable-text">Repeated message</span></div>'));
+    assert.equal((await f.run('send-check',{expected,before,confirmation})).status,'send_unresolved');
+  }finally{await f.close();}
+});
+
+test('Send preserves the persisted baseline and stops before clicking if its latest anchor changes',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'text',chat:'Team A',text:'Prepared text'};
+    await f.run('compose',{text:expected.text});
+    expected.attempt={at:new Date().toISOString(),...await f.run('prepare-send',{authorized:true,expected})};
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(e=>e.insertAdjacentHTML('beforeend','<div data-id="intervening"><span data-testid="selectable-text">Another message</span></div>'));
+    await assert.rejects(f.run('send',{authorized:true,expected}),{code:'DRAFT_CHANGED'});
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+    await f.page.locator('[data-id="intervening"]').evaluate(e=>e.remove());
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(e=>e.insertAdjacentHTML('afterbegin','<div data-id="older" class="message-out"><span data-testid="selectable-text">Prepared text</span></div>'));
+    const result=await f.run('send',{authorized:true,expected});
+    assert.equal(result.status,'outgoing_message_observed');assert.deepEqual(result.messages.map(message=>message.messageId),['out-1']);
+    assert.equal(await f.page.evaluate(()=>window.sent),1);
   }finally{await f.close();}
 });

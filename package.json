@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-web-cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local WhatsApp Web CLI and Codex skill with guided setup and persistent login",
   "license": "MIT",
   "repository": {"type": "git", "url": "https://github.com/SagaBuild/whatsapp-web-cli.git"},

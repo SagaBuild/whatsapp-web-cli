@@ -30,6 +30,8 @@ export function safeFilename(value) {
   }
   name=name.replace(/[. ]+$/g,'');
   if (!name || /^\.+$/.test(name)) name='attachment';
+  // Truncation can remove a suffix after padding and recreate a device name.
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name=`_${name}`;
   return name;
 }
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {chromeCandidates,checkRequirements,npmEntry,samePath,executeNode} from '../scripts/platform.mjs';
+import {dataRoot,chromeCandidates,checkRequirements,npmEntry,samePath,executeNode} from '../scripts/platform.mjs';
 
 const source=fileURLToPath(new URL('../',import.meta.url));
 const scratch=path.join(source,'.work','platform-tests');await fs.mkdir(scratch,{recursive:true});
@@ -19,6 +19,19 @@ test('macOS discovers system and user Chrome installations, with an explicit exe
   for(const value of [home+'/Applications/Google Chrome.app',user])assert.deepEqual(chromeCandidates({...options,env:{WA_CHROME_PATH:value}}),[user]);
   assert.throws(()=>chromeCandidates({...options,env:{WA_CHROME_PATH:'relative.app'}}),{code:'CHROME_PATH'});
   await assert.rejects(checkRequirements({candidates:chromeCandidates({...options,env:{WA_CHROME_PATH:'/missing/chrome'}}),exists:async file=>file===system}),{code:'CHROME_MISSING'});
+});
+
+test('Windows data and Chrome overrides require a drive root or complete UNC path',()=>{
+  for(const value of ['\\synthetic-data\\whatsapp','/synthetic-data/whatsapp','C:relative','\\\\server']){
+    assert.throws(()=>dataRoot({platform:'win32',env:{WA_DATA_DIR:value},home:'C:\\synthetic'}),{code:'DATA_DIRECTORY'},value);
+    assert.throws(()=>chromeCandidates({platform:'win32',env:{WA_CHROME_PATH:value},home:'C:\\synthetic'}),{code:'CHROME_PATH'},value);
+  }
+  for(const value of ['C:\\synthetic\\data','D:/synthetic/data','\\\\server\\share\\data','//server/share/data','\\\\?\\C:\\synthetic\\data','\\\\?\\UNC\\server\\share\\data']){
+    assert.equal(dataRoot({platform:'win32',env:{WA_DATA_DIR:value}}),path.win32.normalize(value));
+    assert.deepEqual(chromeCandidates({platform:'win32',env:{WA_CHROME_PATH:value}}),[path.win32.normalize(value)]);
+  }
+  assert.throws(()=>dataRoot({platform:'win32',env:{LOCALAPPDATA:'\\application-data'}}),{code:'DATA_DIRECTORY'});
+  assert.equal(dataRoot({platform:'darwin',env:{WA_DATA_DIR:'/synthetic/data'}}),'/synthetic/data');
 });
 
 test('Direct installation resolves npm in macOS Intel, Apple Silicon and nvm layouts',async()=>{

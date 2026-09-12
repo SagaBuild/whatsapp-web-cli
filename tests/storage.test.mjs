@@ -62,6 +62,20 @@ test('Long Unicode names preserve extensions within a portable byte budget',()=>
   }
 });
 
+test('Truncation and trailing-space cleanup cannot recreate Windows device names',async()=>{
+  for(const device of ['CON','con','PRN','AUX','NUL','COM1','COM9','LPT1','LPT9']){
+    assert.equal(safeFilename(device+' '.repeat(200)+'x'),'_'+device);
+  }
+  // Assert the safe result before attempting I/O so a regression never opens a device.
+  const filename='CON'+' '.repeat(200)+'x';assert.equal(safeFilename(filename),'_CON');
+  const out=await fs.mkdtemp(path.join(root,'reserved-after-truncation-'));
+  const saved=await saveDownload(out,{messageId:'synthetic-reserved'},async file=>{
+    await fs.writeFile(file,'synthetic attachment');return {filename};
+  });
+  assert.equal(saved.savedFilename,'_CON');
+  assert.equal(await fs.readFile(saved.path,'utf8'),'synthetic attachment');
+});
+
 test('Long CJK, emoji and decomposed download names save distinct collision payloads',async()=>{
   const names=['文'.repeat(176)+'.zip','💬'.repeat(100)+'.txt','Cafe\u0301'.repeat(80)+'.txt'];
   for(const [index,filename] of names.entries()){

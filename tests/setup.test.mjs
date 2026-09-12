@@ -85,6 +85,17 @@ test('Setup keeps an authenticated background session hidden and running',async 
   assert.deepEqual(f.calls,[]);
 });
 
+test('Setup recovers a completed close before reusing or opening the saved profile',async t=>{
+  const f=await loginFixture(t,true),order=[];
+  let recovered=false;
+  f.backend.recoverClosedBrowser=async config=>{assert.equal(config,f.config);order.push('recover');recovered=true;};
+  f.backend.sessionInfo=async()=>{order.push('inspect');return {open:!recovered,profile:f.config.profile,headed:false};};
+  const result=await openLoginWindow(f.config,f.backend);
+  assert.deepEqual(order,['recover','inspect']);
+  assert.equal(result.reused,false);assert.equal(result.headed,true);
+  assert.deepEqual(f.calls,[['open','https://web.whatsapp.com/','--browser=chrome','--headed',`--profile=${f.config.profile}`]]);
+});
+
 test('Setup reveals an unlinked background profile for QR login, but refuses a different profile',async t=>{
   const f=await loginFixture(t,false);
   const result=await openLoginWindow(f.config,f.backend);

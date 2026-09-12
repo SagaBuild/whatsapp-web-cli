@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { browserAction } from './browser.mjs';
-import { settings, findCli, runCli, act, snapshot, sessionInfo, openBrowser, closeBrowser } from './transport.mjs';
+import { settings, findCli, runCli, act, snapshot, sessionInfo, openBrowser, closeBrowser, recoverClosedBrowser } from './transport.mjs';
 import { fail, withLock, saveDownload, safeFilename, hashFile } from './storage.mjs';
 import { checkRequirements, samePath, isMain } from './platform.mjs';
 
@@ -77,8 +77,8 @@ export async function verifyFiles(prepared) {
   }
 }
 
-export async function main(argv,backend={settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser,closeBrowser}) {
-  const {settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser,closeBrowser}=backend;
+export async function main(argv,backend={settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser,closeBrowser,recoverClosedBrowser}) {
+  const {settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser,closeBrowser,recoverClosedBrowser}=backend;
   const parsed=parseArgs({args:argv,allowPositionals:true,strict:true,options:{
     session:{type:'string'},chat:{type:'string'},name:{type:'string'},query:{type:'string'},
     older:{type:'string'},limit:{type:'string'},contains:{type:'string'},message:{type:'string'},item:{type:'string'},
@@ -128,6 +128,7 @@ export async function main(argv,backend={settings,findCli,runCli,act,snapshot,se
       await verifyFiles(pending);
       await writeState(preparedFile,{...pending,kind:'files',names:pending.staged.map(f=>path.basename(f))});
     };
+    if(command==='open')await recoverClosedBrowser?.(config);
     const session=await sessionInfo(config);
     const matchingProfile=await samePath(session.profile,config.profile);
     if(session.open&&!matchingProfile)throw fail('PROFILE_MISMATCH','This session belongs to a different browser profile. Inspect the session configuration before controlling it.');
@@ -241,13 +242,13 @@ export async function main(argv,backend={settings,findCli,runCli,act,snapshot,se
       let result;
       if(command==='send-check'){
         if(!expected.attempt)throw fail('NO_SEND_ATTEMPT','This draft has no recorded send attempt.');
-        result=await call('send-check',{chat:o.chat,expected,before:expected.attempt.before});
+        result=await call('send-check',{chat:o.chat,expected,before:expected.attempt.before,confirmation:expected.attempt.confirmation});
         if(result.status!=='outgoing_message_observed')return result;
       }else{
         if(expected.attempt)throw fail('SEND_UNCERTAIN','This draft already has a recorded send attempt. Use send-check and inspect the chat; do not click Send again automatically.');
         if(expected.kind==='files')await verifyFiles(expected);
-        const {before}=await call('prepare-send',{chat:o.chat,authorized:true,expected});
-        expected.attempt={at:new Date().toISOString(),before};await writeState(preparedFile,expected);
+        const {before,confirmation}=await call('prepare-send',{chat:o.chat,authorized:true,expected});
+        expected.attempt={at:new Date().toISOString(),before,confirmation};await writeState(preparedFile,expected);
         try{result=await call('send',{chat:o.chat,authorized:true,expected});}
         catch(e){
           if(['DRAFT_CHANGED','DRAFT_MISMATCH','SEND_CONTROL','SEND_AUTHORIZATION','WRONG_CHAT','WRONG_ORIGIN','LOGIN_REQUIRED','CHAT_REQUIRED','COMMAND_TOO_LARGE'].includes(e.code)){
@@ -255,6 +256,7 @@ export async function main(argv,backend={settings,findCli,runCli,act,snapshot,se
           }
           throw fail('SEND_UNCERTAIN','Send may have been activated. Use send-check and inspect the chat; do not retry automatically.',{cause:e.code||'ERROR'});
         }
+        if(result?.status!=='outgoing_message_observed')throw fail('SEND_UNCERTAIN','No outgoing message was confirmed. Use send-check and inspect the chat; do not retry automatically.');
       }
       await fs.rm(preparedFile,{force:true});
       await fs.rm(path.join(config.base,'pending-upload.json'),{force:true});

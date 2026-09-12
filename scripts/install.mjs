@@ -2,6 +2,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import {constants} from 'node:fs';
+import {createHash,randomUUID} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {parseArgs} from 'node:util';
 import {fail,withLock} from './storage.mjs';
@@ -10,6 +12,52 @@ import {executeNode,npmEntry,samePath,isMain} from './platform.mjs';
 const sourceRoot=fileURLToPath(new URL('../',import.meta.url));
 const marker='.whatsapp-web-managed';
 const exists=async file=>{try{await fs.access(file);return true;}catch{return false;}};
+
+async function readJson(file){
+  try{return JSON.parse(await fs.readFile(file,'utf8'));}
+  catch(error){if(error.code==='ENOENT'||error instanceof SyntaxError)return null;throw error;}
+}
+
+function dependencyPackages(lock){
+  if(!lock?.packages||typeof lock.packages!=='object'||Array.isArray(lock.packages))return null;
+  return Object.fromEntries(Object.entries(lock.packages).filter(([name])=>name));
+}
+
+function dependencyFingerprint(packages){
+  if(!packages)return null;
+  const canonical=value=>Array.isArray(value)?value.map(canonical)
+    :value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
+  return createHash('sha256').update(JSON.stringify(canonical(packages))).digest('hex');
+}
+
+async function installedVersionsMatch(destination,packages){
+  for(const [directory,expected] of Object.entries(packages)){
+    const installed=await readJson(path.join(destination,directory,'package.json'));
+    if(!installed||installed.version!==expected.version)return false;
+  }
+  return true;
+}
+
+async function validateDestinationFile(destination,target,{same=false}={}){
+  let cursor=target;
+  while(cursor!==path.dirname(destination)){
+    try{
+      const stat=await fs.lstat(cursor);
+      if(stat.isSymbolicLink()&&!(same&&cursor===destination))throw fail('INSTALL_DESTINATION','Destination files/directories cannot be symbolic links.');
+      if(cursor===target&&!stat.isFile())throw fail('INSTALL_DESTINATION','Managed destination files must be regular files.');
+    }catch(error){if(error.code!=='ENOENT')throw error;}
+    if(cursor===destination)break;cursor=path.dirname(cursor);
+  }
+}
+
+async function replaceFile(target,write){
+  await fs.mkdir(path.dirname(target),{recursive:true});
+  const temporary=path.join(path.dirname(target),`.wa-install-${randomUUID()}.tmp`);
+  try{await write(temporary);await fs.rename(temporary,target);}
+  finally{await fs.rm(temporary,{force:true});}
+}
+
+const writeMarker=(file,state)=>replaceFile(file,temporary=>fs.writeFile(temporary,JSON.stringify(state)+'\n',{flag:'wx',mode:0o600}));
 
 export async function defaultDestination({env=process.env,home=os.homedir()}={}) {
   const current=path.join(home,'.agents','skills','whatsapp-web');
@@ -45,34 +93,44 @@ export async function installSkill({source=sourceRoot,destination,emit=()=>{}}={
   if(!same){
     const relative=path.relative(destination,source);
     if(!relative.startsWith('..')&&!path.isAbsolute(relative))throw fail('INSTALL_DESTINATION','The destination cannot contain the source checkout.');
-    if(await exists(destination)&&!await exists(path.join(destination,marker)))throw fail('UNMANAGED_INSTALL','The destination already exists and is not managed by this installer. Choose another --destination.');
   }
   return withLock(destination+'.install.lock',async()=>{
-    let oldLock;try{oldLock=JSON.parse(await fs.readFile(path.join(destination,'package-lock.json'),'utf8'));}catch{}
-    const packageDependencies=lock=>Object.fromEntries(Object.entries(lock?.packages||{}).filter(([name])=>name));
+    const markerFile=path.join(destination,marker);
+    if(!same&&await exists(destination)&&!await exists(markerFile))throw fail('UNMANAGED_INSTALL','The destination already exists and is not managed by this installer. Choose another --destination.');
+    // Validate every target before closing a browser or replacing any installed code.
+    for(const entry of [...inventory,marker])await validateDestinationFile(destination,path.join(destination,entry),{same});
+    const packages=dependencyPackages(rootLock);
+    if(!packages)throw fail('INSTALL_SOURCE','The source dependency lockfile is invalid.');
+    const wantedFingerprint=dependencyFingerprint(packages),managed=await readJson(markerFile);
+    // A legacy version-only marker has no successful-install receipt. npm's hidden
+    // lock describes its installed tree, unlike the desired lock copied into the skill.
+    const installedFingerprint=managed?.schemaVersion===1?managed.dependencyFingerprint
+      :dependencyFingerprint(dependencyPackages(await readJson(path.join(destination,'node_modules','.package-lock.json'))));
     const cli=path.join(destination,'node_modules','@playwright','cli','playwright-cli.js');
-    const needsDependencies=!await exists(cli)||JSON.stringify(packageDependencies(oldLock))!==JSON.stringify(packageDependencies(rootLock));
-    if(!same&&needsDependencies&&await exists(path.join(destination,marker))&&await exists(cli)){
+    const needsDependencies=!await exists(cli)||installedFingerprint!==wantedFingerprint||!await installedVersionsMatch(destination,packages);
+    // Resolve npm before changing a healthy installed copy or closing its browser.
+    const npm=needsDependencies?await dependencies.npm():null;
+    if(!same&&needsDependencies&&await exists(markerFile)&&await exists(cli)){
       emit('Updating browser dependencies; closing the managed browser while retaining its profile.');
       await dependencies.execute([path.join(destination,'scripts','wa.mjs'),'close'],{cwd:destination});
     }
     await fs.mkdir(destination,{recursive:true});
+    const state={schemaVersion:1,version:pkg.version,dependencyFingerprint:wantedFingerprint};
+    // Establish management on a fresh destination, and force repair after an
+    // interrupted dependency update even if its new desired lockfile was copied.
+    if(needsDependencies)await writeMarker(markerFile,{...state,dependencyFingerprint:null});
     if(!same)for(const entry of inventory){
       const target=path.join(destination,entry);
-      // Refuse symlinked destination components before replacing a managed file.
-      let cursor=target;
-      while(cursor!==path.dirname(destination)){
-        try{if((await fs.lstat(cursor)).isSymbolicLink())throw fail('INSTALL_DESTINATION','Destination files/directories cannot be symbolic links.');}catch(e){if(e.code!=='ENOENT')throw e;}
-        if(cursor===destination)break;cursor=path.dirname(cursor);
-      }
-      await fs.mkdir(path.dirname(target),{recursive:true});
-      await fs.copyFile(path.join(source,entry),target);
+      await replaceFile(target,temporary=>fs.copyFile(path.join(source,entry),temporary,constants.COPYFILE_EXCL));
     }
-    await fs.writeFile(path.join(destination,marker),pkg.version+'\n');
     if(needsDependencies){
       emit('Installing the pinned browser dependency.');
-      await dependencies.execute([await dependencies.npm(),'ci','--ignore-scripts','--no-audit','--no-fund'],{cwd:destination});
+      await dependencies.execute([npm,'ci','--ignore-scripts','--no-audit','--no-fund'],{cwd:destination});
+      if(!await exists(cli)||!await installedVersionsMatch(destination,packages))throw fail('INSTALL_DEPENDENCIES','The installed browser dependency versions could not be verified. Run setup again to repair them.');
     }
+    // Browser/Chrome readiness is separate from a completed npm installation.
+    // Preserve that evidence if doctor fails so a retry need not reset dependencies.
+    await writeMarker(markerFile,state);
     await dependencies.execute([path.join(destination,'scripts','wa.mjs'),'doctor'],{cwd:destination});
     return {skillDirectory:destination,cli:path.join(destination,'scripts','wa.mjs'),version:pkg.version,dependenciesInstalled:needsDependencies};
   });

@@ -5,23 +5,32 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {fail} from './storage.mjs';
 
+function fullyQualified(file,platform){
+  if(platform!=='win32')return path.posix.isAbsolute(file);
+  const value=path.win32.normalize(file);
+  if(/^[a-z]:\\/i.test(value))return true;
+  if(value.startsWith('\\\\?\\'))return /^\\\\\?\\(?:[a-z]:\\|UNC\\[^\\]+\\[^\\]+(?:\\|$))/i.test(value);
+  if(value.startsWith('\\\\.\\'))return false;
+  return /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(value);
+}
+
 export function dataRoot({platform=process.platform,env=process.env,home=os.homedir()}={}) {
   const paths=platform==='win32'?path.win32:path.posix;
   if(env.WA_DATA_DIR){
-    if(!paths.isAbsolute(env.WA_DATA_DIR))throw fail('DATA_DIRECTORY','WA_DATA_DIR must be absolute so different projects reuse the same login.');
+    if(!fullyQualified(env.WA_DATA_DIR,platform))throw fail('DATA_DIRECTORY','WA_DATA_DIR must be fully qualified (a drive-rooted or UNC path on Windows) so different projects reuse the same login.');
     return paths.normalize(env.WA_DATA_DIR);
   }
   const parent=platform==='win32'?(env.LOCALAPPDATA||paths.join(home,'AppData','Local'))
     :platform==='darwin'?paths.join(home,'Library','Application Support')
     :(env.XDG_DATA_HOME||paths.join(home,'.local','share'));
-  if(!paths.isAbsolute(parent))throw fail('DATA_DIRECTORY','The application data directory must be absolute.');
+  if(!fullyQualified(parent,platform))throw fail('DATA_DIRECTORY','The application data directory must be fully qualified.');
   return paths.join(parent,'codex-whatsapp-web');
 }
 
 export function chromeCandidates({platform=process.platform,env=process.env,home=os.homedir()}={}) {
   const paths=platform==='win32'?path.win32:path.posix;
   if(env.WA_CHROME_PATH){
-    if(!paths.isAbsolute(env.WA_CHROME_PATH))throw fail('CHROME_PATH','WA_CHROME_PATH must be an absolute Chrome executable or macOS .app path.');
+    if(!fullyQualified(env.WA_CHROME_PATH,platform))throw fail('CHROME_PATH','WA_CHROME_PATH must be a fully qualified Chrome executable or macOS .app path.');
     const explicit=paths.normalize(env.WA_CHROME_PATH);
     return [platform==='darwin'&&/\.app\/?$/i.test(explicit)?paths.join(explicit,'Contents','MacOS','Google Chrome'):explicit];
   }

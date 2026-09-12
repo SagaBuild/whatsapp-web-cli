@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {createServer} from 'node:http';
 import {main,stageFiles,verifyFiles} from '../scripts/wa.mjs';
+import {browserAction} from '../scripts/browser.mjs';
+import {playwrightModule} from '../scripts/transport.mjs';
+import {checkRequirements} from '../scripts/platform.mjs';
 
 const root=fileURLToPath(new URL('../.work/cli-tests/',import.meta.url));
 await fs.mkdir(root,{recursive:true});
@@ -29,12 +33,12 @@ async function fixture(){
       if(op==='upload')return {filesSet:true};
       if(op==='verify-upload')return {status:'files_staged',files:args.files,sent:false};
       if(op==='guard')return {chat:args.chat};
-      if(op==='prepare-send')return {before:['old-message']};
-      if(op==='send'){if(state.uncertain)throw Object.assign(Error('backend disconnected'),{code:'BROWSER_ERROR'});return {status:'outgoing_message_observed',messages:[{messageId:'new-message'}]};}
+      if(op==='prepare-send')return {before:['old-message'],confirmation:{version:1,anchorId:'old-message',atLatest:true}};
+      if(op==='send'){state.attemptAtSend=JSON.parse(await fs.readFile(path.join(base,'prepared-draft.json'),'utf8')).attempt;if(state.uncertain)throw Object.assign(Error('backend disconnected'),{code:'BROWSER_ERROR'});return {status:state.unresolved?'send_unresolved':'outgoing_message_observed',messages:[{messageId:'new-message'}]};}
       if(op==='send-check')return state.checked?{status:'outgoing_message_observed',messages:[{messageId:'new-message'}]}:{status:'send_unresolved'};
       assert.fail('Unexpected browser operation: '+op);
     }};
-  return {config,log,state,run:args=>main(args,backend),prepared:path.join(base,'prepared-draft.json')};
+  return {config,log,state,backend,run:args=>main(args,backend),prepared:path.join(base,'prepared-draft.json')};
 }
 
 test('Every staged file keeps its bytes when basenames and generated collision names overlap',async()=>{
@@ -76,13 +80,53 @@ test('An interrupted send is persisted, cannot be repeated, and can be checked w
   await f.run(['compose','--chat','Team A','--text-file',file]);
   f.state.uncertain=true;
   await assert.rejects(f.run(['send','--chat','Team A','--authorized']),{code:'SEND_UNCERTAIN'});
-  assert.ok(JSON.parse(await fs.readFile(f.prepared,'utf8')).attempt.at);
+  const recorded=JSON.parse(await fs.readFile(f.prepared,'utf8'));
+  assert.ok(recorded.attempt.at);
+  assert.deepEqual(recorded.attempt.confirmation,{version:1,anchorId:'old-message',atLatest:true});
+  assert.deepEqual(f.state.attemptAtSend,recorded.attempt,'Recovery evidence must be durable before Send can be activated');
   await assert.rejects(f.run(['send','--chat','Team A','--authorized']),{code:'SEND_UNCERTAIN'});
   assert.equal(f.log.filter(e=>e.op==='send').length,1);
   assert.equal((await f.run(['send-check','--chat','Team A'])).status,'send_unresolved');
+  const check=f.log.find(e=>e.op==='send-check');
+  assert.deepEqual(check.args.before,recorded.attempt.before);
+  assert.deepEqual(check.args.confirmation,recorded.attempt.confirmation);
+  assert.deepEqual(JSON.parse(await fs.readFile(f.prepared,'utf8')),recorded);
   f.state.checked=true;assert.equal((await f.run(['send-check','--chat','Team A'])).messages[0].messageId,'new-message');
   await assert.rejects(fs.access(f.prepared),{code:'ENOENT'});
   assert.equal(f.log.filter(e=>e.op==='send').length,1);
+});
+
+test('An unconfirmed send response preserves the attempt and blocks another activation',async()=>{
+  const f=await fixture(),file=path.join(f.config.base,'text.txt');await fs.writeFile(file,'Prepared text');
+  await f.run(['compose','--chat','Team A','--text-file',file]);
+  f.state.unresolved=true;
+  await assert.rejects(f.run(['send','--chat','Team A','--authorized']),{code:'SEND_UNCERTAIN'});
+  const pending=await fs.readFile(f.prepared,'utf8');
+  await assert.rejects(f.run(['send','--chat','Team A','--authorized']),{code:'SEND_UNCERTAIN'});
+  assert.equal(await fs.readFile(f.prepared,'utf8'),pending);
+  assert.equal(f.log.filter(e=>e.op==='send').length,1);
+});
+
+test('Loading historical outgoing text cannot clear an uncertain attempt through the CLI',async()=>{
+  const f=await fixture();
+  const server=createServer((_request,response)=>response.end('<div id="side"></div><div id="main"><header>Team A</header><div data-testid="conversation-panel-messages" style="height:200px;overflow:auto"><div data-id="old-history" class="message-out"><span data-pre-plain-text="[10:00, 1/1/2020] Test: "></span><span data-testid="selectable-text">Repeated message</span></div><div data-id="recent-message"><span data-testid="selectable-text">Recent baseline</span></div></div><footer><div role="textbox" contenteditable="true"></div></footer></div>'));
+  let browser;
+  try{
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    const {chromium}=await playwrightModule(),{chrome}=await checkRequirements();
+    browser=await chromium.launch({channel:'chrome',executablePath:chrome,headless:true});
+    const page=await browser.newPage();
+    await page.route('**/*',route=>new URL(route.request().url()).hostname==='127.0.0.1'?route.continue():route.abort());
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
+    f.backend.act=(_config,_function,operation,args)=>browserAction(page,operation,{...args,fixture:true});
+    for(const confirmation of [undefined,{version:1,anchorId:'recent-message',atLatest:true}]){
+      const prepared={chat:'Team A',kind:'text',text:'Repeated message',attempt:{at:'2026-09-12T12:00:00.000Z',before:['recent-message'],confirmation}};
+      const original=JSON.stringify(prepared);await fs.writeFile(f.prepared,original);
+      assert.equal((await f.run(['send-check','--chat','Team A'])).status,'send_unresolved');
+      assert.equal(await fs.readFile(f.prepared,'utf8'),original);
+      await assert.rejects(f.run(['send','--chat','Team A','--authorized']),{code:'SEND_UNCERTAIN'});
+    }
+  }finally{await browser?.close();if(server.listening)await new Promise(resolve=>server.close(resolve));}
 });
 
 test('Unresolved sends block text and file preparation across chats without changing the attempt',async()=>{
@@ -176,6 +220,21 @@ test('Open reselects an existing WhatsApp tab; close refuses an unrelated profil
   assert.deepEqual(f.log.filter(e=>e.cli).map(e=>e.cli),[['tab-list'],['tab-select','0']]);
   f.log.length=0;f.state.profile=path.join(f.config.base,'another-profile');
   await assert.rejects(f.run(['close']),{code:'PROFILE_MISMATCH'});assert.deepEqual(f.log,[]);
+});
+
+test('Open recovers a completed close before deciding whether to reuse the daemon',async()=>{
+  const f=await fixture(),order=[];
+  f.backend.recoverClosedBrowser=async config=>{assert.equal(config,f.config);order.push('recover');f.state.open=false;};
+  const info=f.backend.sessionInfo;
+  f.backend.sessionInfo=async config=>{order.push('inspect');return info(config);};
+  const result=await f.run(['open']);
+  assert.deepEqual(order,['recover','inspect']);
+  assert.equal(result.reused,false);assert.equal(result.profile,f.config.profile);
+  assert.equal(f.log.filter(e=>e.cli?.[0]==='open').length,1);
+  f.backend.recoverClosedBrowser=async()=>{throw Object.assign(Error('Unconfirmed shutdown'),{code:'BROWSER_CLOSE_PENDING'});};
+  const calls=f.state.browserCalls;
+  await assert.rejects(f.run(['open']),{code:'BROWSER_CLOSE_PENDING'});
+  assert.equal(f.state.browserCalls,calls);
 });
 
 test('Closed sessions launch in the background by default, with the same profile in visible mode',async()=>{
