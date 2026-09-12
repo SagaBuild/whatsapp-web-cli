@@ -58,6 +58,18 @@ test('Recovery detects changes in both original files and private staging copies
   await fs.writeFile(staged.staged[0],'original');await fs.writeFile(file,'new revision');await assert.rejects(verifyFiles(staged),{code:'UPLOAD_CHANGED'});
 });
 
+test('Send rechecks prepared source and staged bytes before recording or activating an attempt',async()=>{
+  for(const target of ['originals','staged']){
+    const f=await fixture(),file=path.join(f.config.base,'file.txt');await fs.writeFile(file,'original');
+    await f.run(['upload','--chat','Team A','--file',file]);
+    const prepared=await fs.readFile(f.prepared,'utf8'),saved=JSON.parse(prepared);
+    await fs.writeFile(saved[target][0],'modified');
+    await assert.rejects(f.run(['send','--chat','Team A','--authorized']),{code:'UPLOAD_CHANGED'});
+    assert.equal(await fs.readFile(f.prepared,'utf8'),prepared);
+    assert.equal(f.log.filter(entry=>entry.op==='prepare-send'||entry.op==='send').length,0);
+  }
+});
+
 test('Inapplicable flags and extra positional arguments fail before browser access',async()=>{
   const f=await fixture();
   await assert.rejects(f.run(['messages','--chat','Team A','--open','https://example.test/']),{code:'BAD_ARGUMENT'});

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {dataRoot,chromeCandidates,checkRequirements,npmEntry,samePath,executeNode} from '../scripts/platform.mjs';
+import {dataRoot,chromeCandidates,checkRequirements,npmEntry,samePath,executeNode,checkCliHealth} from '../scripts/platform.mjs';
 
 const source=fileURLToPath(new URL('../',import.meta.url));
 const scratch=path.join(source,'.work','platform-tests');await fs.mkdir(scratch,{recursive:true});
@@ -67,4 +67,34 @@ test('CLI entrypoints invoked through a real directory alias execute and preserv
     const result=await executeNode([path.join(alias,'scripts',file),...args],{cwd:root});
     assert.ok(result.stdout.trim(),`${file} must not silently exit through a symlink`);
   }
+});
+
+test('Child process failures retain diagnostics and timeouts terminate the spawned process',async()=>{
+  await assert.rejects(executeNode(['-e','process.stderr.write("synthetic child failure");process.exitCode=7;']),error=>error.code==='PROCESS_FAILED'&&error.message==='synthetic child failure');
+  const pidFile=path.join(root,'timed-out-child.pid');
+  const script=path.join(root,'timed-out-child.mjs');
+  await fs.writeFile(script,"import fs from 'node:fs'; fs.writeFileSync(process.argv[2],String(process.pid)); setInterval(()=>{},1000);\n");
+  await assert.rejects(executeNode([script,pidFile],{timeout:1000}),{code:'PROCESS_TIMEOUT'});
+  const pid=Number(await fs.readFile(pidFile,'utf8'));
+  // The child is our own recorded process; wait only for its termination, never
+  // probe or signal an unrelated PID from a guessed stale lock fixture.
+  let alive=true;
+  for(let attempt=0;attempt<50&&alive;attempt++){
+    try{process.kill(pid,0);await new Promise(resolve=>setTimeout(resolve,10));}
+    catch(error){assert.equal(error.code,'ESRCH');alive=false;}
+  }
+  assert.equal(alive,false,'Timed-out child must not remain alive');
+});
+
+test('CLI health executes the dependency and rejects missing implementation, empty output and version mismatch',async()=>{
+  const directory=path.join(root,'health');await fs.mkdir(directory);
+  const cli=path.join(directory,'playwright-cli.cjs'),runtime=path.join(directory,'runtime.cjs');
+  await fs.writeFile(cli,"if(process.env.NO_UPDATE_NOTIFIER!=='1')throw Error('Updates must be disabled');require('./runtime.cjs');\n");
+  await fs.writeFile(runtime,"console.log('0.1.19');\n");
+  assert.deepEqual(await checkCliHealth(cli,{cwd:directory,expectedVersion:'0.1.19'}),{cli,version:'0.1.19'});
+  await assert.rejects(checkCliHealth(cli,{expectedVersion:'0.1.20'}),{code:'CLI_UNHEALTHY'});
+  await fs.unlink(runtime);
+  await assert.rejects(checkCliHealth(cli),{code:'CLI_UNHEALTHY'});
+  await fs.writeFile(cli,'// empty but exits successfully');
+  await assert.rejects(checkCliHealth(cli),{code:'CLI_UNHEALTHY'});
 });

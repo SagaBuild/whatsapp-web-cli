@@ -2,14 +2,21 @@ import {test,after} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
+import os from 'node:os';
 import {createRequire} from 'node:module';
-import {settings,findCli,runCli,parseResult,act,sessionInfo,openBrowser,closeBrowser,recoverClosedBrowser} from '../scripts/transport.mjs';
+import {createHash} from 'node:crypto';
+import {settings,findCli,runCli,parseResult,act,snapshot,sessionInfo,openBrowser,closeBrowser,recoverClosedBrowser} from '../scripts/transport.mjs';
+import {createBrowserFixture} from './helpers/browser-fixture.mjs';
 
-const scratch=fileURLToPath(new URL('../.work/transport-tests/',import.meta.url));
-await fs.mkdir(scratch,{recursive:true});
-const root=await fs.mkdtemp(path.join(scratch,'run-'));
-after(async()=>{assert.equal(path.dirname(root),path.resolve(scratch));await fs.rm(root,{recursive:true,force:true});});
+// Chrome's IndexedDB backing store is sensitive to deeply nested Windows paths.
+const scratch=await fs.realpath(os.tmpdir());
+const root=await fs.mkdtemp(path.join(scratch,'wa-transport-'));
+const browsers=[];
+after(async()=>{
+  assert.ok(browsers.every(browser=>browser.cleaned),'Retain the private registry until every synthetic browser exits.');
+  assert.equal(path.dirname(await fs.realpath(root)),scratch);
+  await fs.rm(root,{recursive:true,force:true,maxRetries:10,retryDelay:100});
+});
 const fixtureDir=await fs.mkdtemp(path.join(root,'backend-'));
 const fixture=path.join(fixtureDir,'backend.mjs');
 const require=createRequire(import.meta.url);
@@ -53,6 +60,22 @@ async function isolated(t) {
     t.after(()=>{if(previous===undefined)delete process.env[name];else process.env[name]=previous;});
   }
   return settings('fixture');
+}
+
+function browserFixture(t,config){
+  const browser=createBrowserFixture(config,{root});
+  browsers.push(browser);
+  // A separate hook preserves a failing test's original error and does not use
+  // closeBrowser, which may be the broken function that caused the failure.
+  t.after(()=>browser.cleanup());
+  return browser;
+}
+
+async function syntheticBackend(config,name,code){
+  await fs.mkdir(config.cwd,{recursive:true});
+  const file=path.join(config.cwd,name+'.mjs');
+  await fs.writeFile(file,code);
+  process.env.WA_PLAYWRIGHT_CLI=file;
 }
 
 async function lostCloseResponseBackend(config){
@@ -129,6 +152,28 @@ test('Structured actions roundtrip values and preserve reported errors',async t=
   assert.throws(()=>parseResult('### Result\nnot JSON\n### Page\n'),{code:'RESULT_INVALID'});
 });
 
+test('Valid JSON with a malformed action envelope cannot become a successful result',async t=>{
+  const config=await isolated(t);
+  for(const envelope of [{},null,[],'unwrapped result',42,{unrelated:true}]){
+    await syntheticBackend(config,'malformed-action',`console.log('### Result\\n'+${JSON.stringify(JSON.stringify(envelope))});`);
+    await assert.rejects(act(config,async()=>true,'fixture'),{code:'RESULT_INVALID'});
+  }
+});
+
+test('Snapshot requests cannot return stale content when the backend omits a new file',async t=>{
+  const config=await isolated(t),file=path.join(config.cwd,'.wa-snapshot.yml');
+  await syntheticBackend(config,'missing-snapshot',`console.log('### Page\\nSynthetic backend omitted the snapshot');`);
+  await fs.writeFile(file,'previous chat snapshot');
+  await assert.rejects(snapshot(config),{code:'ENOENT'});
+  await syntheticBackend(config,'chooser-snapshot',`console.log('### Modal state\\n- [File chooser]:');`);
+  await fs.writeFile(file,'previous chat snapshot');
+  assert.deepEqual(await snapshot(config),{snapshot:'',fileChooserPending:true});
+  await syntheticBackend(config,'fresh-snapshot',`import fs from 'node:fs/promises';
+const file=process.argv.find(arg=>arg.startsWith('--filename=')).slice('--filename='.length);
+await fs.writeFile(file,'current chat snapshot');console.log('### Page\\nSynthetic fresh snapshot');`);
+  assert.deepEqual(await snapshot(config),{snapshot:'current chat snapshot',fileChooserPending:false});
+});
+
 test('Large quoted Unicode actions use private command files and remove completed commands',async t=>{
   const config=await isolated(t);
   const text='团队 💬 "quoted" \\ and line\n'.repeat(2500);
@@ -155,10 +200,20 @@ test('Session metadata selects the exact session from structured backend output'
   assert.equal(info.headed,false);
 });
 
+test('Duplicate exact session names are rejected even when the first record has the expected profile',async t=>{
+  const config=await isolated(t);
+  const first={name:config.session,status:'open',userDataDir:config.profile};
+  await syntheticBackend(config,'duplicate-sessions',`console.log(${JSON.stringify(JSON.stringify({browsers:[first,{...first,userDataDir:path.join(config.base,'other-profile')}]}))});`);
+  await assert.rejects(sessionInfo(config),{code:'SESSION_AMBIGUOUS'});
+  await syntheticBackend(config,'no-session',`console.log(${JSON.stringify(JSON.stringify({browsers:[{...first,name:'another-session'}]}))});`);
+  assert.deepEqual(await sessionInfo(config),{open:false,known:false});
+});
+
 test('The actual pinned CLI launches the detected Chrome and reopens only its isolated persistent profile',async t=>{
   const config=await isolated(t);
   process.env.WA_PLAYWRIGHT_CLI=require.resolve('@playwright/cli/playwright-cli.js');
-  const open=()=>openBrowser(config,{url:'about:blank'});
+  const browser=browserFixture(t,config);
+  const open=async()=>{await openBrowser(config,{url:'about:blank'});await browser.record();};
   const persistedStorage=async(page,_operation,{write=false}={})=>{
     await page.route('https://transport.fixture.test/**',route=>route.fulfill({contentType:'text/html',body:'<title>Synthetic profile</title>'}));
     await page.goto('https://transport.fixture.test/');
@@ -181,7 +236,6 @@ test('The actual pinned CLI launches the detected Chrome and reopens only its is
       }finally{database.close();}
     },write);
   };
-  try {
     await open();
     assert.equal((await sessionInfo(config)).profile,config.profile);
     assert.equal((await sessionInfo(config)).headed,false);
@@ -210,17 +264,13 @@ test('The actual pinned CLI launches the detected Chrome and reopens only its is
     await closeBrowser(config);
     await open();
     assert.deepEqual(await act(config,persistedStorage,'fixture'),savedStorage);
-  } finally {
-    // Close while fixture registry overrides are still active; test.after restores them.
-    await closeBrowser(config);
-    assert.equal((await sessionInfo(config)).open,false);
-  }
 });
 
 test('A lost completed shutdown reply recovers the idle daemon and preserves its persistent cookie',async t=>{
   const config=await isolated(t),fault=await lostCloseResponseBackend(config);
-  try{
+  const browser=browserFixture(t,config);
     await openBrowser(config,{url:'about:blank'});
+    await browser.record();
     await act(config,async page=>{
       await page.context().addCookies([{name:'lost-reply',value:'synthetic-persistent-cookie',url:'https://transport.fixture.test',expires:Math.floor(Date.now()/1000)+3600}]);
       return {saved:true};
@@ -231,20 +281,17 @@ test('A lost completed shutdown reply recovers the idle daemon and preserves its
     assert.equal((await sessionInfo(config)).open,false);
     await assert.rejects(fs.access(path.join(config.cwd,'.wa-close-completed.json')),{code:'ENOENT'});
     await openBrowser(config,{url:'about:blank'});
+    await browser.record();
     const cookies=await act(config,async page=>page.context().cookies('https://transport.fixture.test'),'fixture');
     assert.equal(cookies.find(cookie=>cookie.name==='lost-reply')?.value,'synthetic-persistent-cookie');
-  }finally{
-    await fs.rm(fault.flag,{force:true});
-    await closeBrowser(config);
-    assert.equal((await sessionInfo(config)).open,false);
-  }
 });
 
 test('Interrupted shutdown recovery needs no page and an old receipt cannot stop a new daemon for the same profile',async t=>{
   const config=await isolated(t),fault=await lostCloseResponseBackend(config);
+  const browser=browserFixture(t,config);
   const receiptFile=path.join(config.cwd,'.wa-close-completed.json');
-  try{
     await openBrowser(config,{url:'about:blank'});
+    await browser.record();
     await fs.writeFile(fault.flag,'interrupt-recovery');
     await assert.rejects(closeBrowser(config),{code:'BROWSER_ERROR',message:'Synthetic recovery interruption\n'});
     assert.deepEqual(parseResult(await fs.readFile(fault.reply,'utf8')).value,{browserClosed:true});
@@ -258,16 +305,55 @@ test('Interrupted shutdown recovery needs no page and an old receipt cannot stop
     assert.equal((await sessionInfo(config)).open,false);
     await assert.rejects(fs.access(receiptFile),{code:'ENOENT'});
     await openBrowser(config,{url:'about:blank'});
+    await browser.record();
     await fs.writeFile(receiptFile,receipt);
     assert.equal(await recoverClosedBrowser(config),false,'A new registration invalidates completion evidence from the previous daemon.');
     assert.equal(await fs.readFile(receiptFile,'utf8'),receipt);
     assert.equal((await sessionInfo(config)).open,true);
     assert.equal(await act(config,async page=>page.url(),'fixture'),'about:blank');
-  }finally{
-    await fs.rm(fault.flag,{force:true});
-    await closeBrowser(config);
-    assert.equal((await sessionInfo(config)).open,false);
-  }
+});
+
+test('Independent fixture cleanup stops only its recorded browser after production shutdown fails',async t=>{
+  const config=await isolated(t);
+  process.env.WA_PLAYWRIGHT_CLI=require.resolve('@playwright/cli/playwright-cli.js');
+  const browser=browserFixture(t,config);
+  await openBrowser(config,{url:'about:blank'});
+  await browser.record();
+  const failure=Object.assign(Error('Synthetic incompatible shutdown handler'),{code:'BROWSER_CLOSE_UNSUPPORTED'});
+  await assert.rejects(closeBrowser(config,{request:async()=>{throw failure;}}),error=>error===failure);
+  assert.equal((await sessionInfo(config)).open,true);
+  await browser.cleanup();
+  assert.equal(browser.cleaned,true);
+  for(const pid of browser.processes)assert.throws(()=>process.kill(pid,0),{code:'ESRCH'});
+  assert.equal((await sessionInfo(config)).open,false);
+});
+
+test('Identical registration bytes in a replacement file invalidate authentic shutdown evidence',async t=>{
+  const config=await isolated(t);
+  const registryFile=path.join(process.env.PWTEST_DAEMON_SESSION_DIR,createHash('sha1').update(config.cwd).digest('hex').slice(0,16),config.session+'.session');
+  const text=JSON.stringify({name:config.session,browser:{userDataDir:config.profile},workspaceDir:config.cwd,timestamp:1,socketPath:'synthetic-only'});
+  await fs.mkdir(path.dirname(registryFile),{recursive:true});await fs.writeFile(registryFile,text);
+  // Let the production close code generate its own receipt in a Node-only
+  // backend. No test-side copy of the identity-hashing algorithm is involved.
+  await syntheticBackend(config,'synthetic-close',`import fs from 'node:fs/promises';
+const command=process.argv.find(arg=>arg.startsWith('--filename='));
+const source=await fs.readFile(command.slice('--filename='.length),'utf8');
+function backendCloseListener(){return 'deleteSessionFile gracefullyProcessExitDoNotHang';}
+const context={listeners:()=>[backendCloseListener],removeListener(){},on(){},async close(){}};
+console.log('### Result\\n'+JSON.stringify(await (0,eval)('('+source+')')({context:()=>context})));`);
+  let observations=0;
+  await assert.rejects(closeBrowser(config,{info:async()=>{
+    if(++observations>=3)throw Object.assign(Error('Synthetic recovery interruption'),{code:'FIXTURE_INTERRUPTION'});
+    return {open:true,profile:config.profile,workspace:config.cwd};
+  }}),{code:'FIXTURE_INTERRUPTION'});
+  const receiptFile=path.join(config.cwd,'.wa-close-completed.json'),receipt=await fs.readFile(receiptFile,'utf8');
+  await fs.writeFile(registryFile+'.new',text);await fs.rename(registryFile+'.new',registryFile);
+  let stopped=false;
+  assert.equal(await recoverClosedBrowser(config,{
+    info:async()=>({open:!stopped,profile:config.profile,workspace:config.cwd}),stop:async()=>{stopped=true;}
+  }),false);
+  assert.equal(stopped,false,'A prior registration cannot authorize stopping its replacement.');
+  assert.equal(await fs.readFile(receiptFile,'utf8'),receipt);
 });
 
 test('Recovery is a no-op for missing, unrelated or unregistered completion evidence',async t=>{
@@ -309,6 +395,20 @@ test('Recovery waits for the acknowledged idle daemon to exit without issuing an
   assert.equal(await fs.readFile(receiptFile,'utf8'),JSON.stringify(receipt));
 });
 
+test('Recovery preserves a replacement receipt written while the old daemon stops',async t=>{
+  const config=await isolated(t),receiptFile=path.join(config.cwd,'.wa-close-completed.json');
+  const identity={registryFile:path.join(config.base,'synthetic.session'),instance:'a'.repeat(64)};
+  const receipt={schemaVersion:1,browserClosed:true,session:config.session,profile:config.profile,...identity,nonce:'00000000-0000-4000-8000-000000000000'};
+  const replacement={...receipt,nonce:'00000000-0000-4000-8000-000000000001'};
+  await fs.mkdir(config.cwd,{recursive:true});await fs.writeFile(receiptFile,JSON.stringify(receipt));
+  let stopped=false;
+  assert.equal(await recoverClosedBrowser(config,{
+    info:async()=>({open:!stopped,profile:config.profile}),identity:async()=>identity,
+    stop:async()=>{await fs.writeFile(receiptFile,JSON.stringify(replacement));stopped=true;}
+  }),true);
+  assert.deepEqual(JSON.parse(await fs.readFile(receiptFile,'utf8')),replacement);
+});
+
 test('Shutdown refuses another profile and accepts a confirmed close after a disconnected reply',async t=>{
   const config=await isolated(t);let requests=0;
   const request=async()=>{requests++;throw Object.assign(Error('Session closed'),{code:'BROWSER_ERROR'});};
@@ -324,6 +424,19 @@ test('An unconfirmed shutdown never reports success or falls back to a forced cl
   await assert.rejects(closeBrowser(config,{info:async()=>({open:true,profile:config.profile}),
     request:async()=>{requests++;},now:()=>clock,sleep:async()=>{clock+=10000;}}),{code:'BROWSER_CLOSE_PENDING'});
   assert.equal(requests,1);
+});
+
+test('Unknown and incompatible shutdown errors retain their original identity without a timeout delay',async t=>{
+  const config=await isolated(t);
+  for(const code of ['BROWSER_CLOSE_UNSUPPORTED','BROWSER_SESSION_CHANGED','EACCES']){
+    const failure=Object.assign(Error('Synthetic shutdown failure'),{code,details:{preserve:true}});
+    let clock=0,sleeps=0;
+    await assert.rejects(closeBrowser(config,{
+      info:async()=>({open:true,profile:config.profile}),request:async()=>{throw failure;},
+      now:()=>clock,sleep:async()=>{clock+=10000;sleeps++;}
+    }),error=>error===failure);
+    assert.equal(sleeps,0);
+  }
 });
 
 test('The discovered Chrome executable and visibility reach the backend without shell quoting or global settings',async t=>{

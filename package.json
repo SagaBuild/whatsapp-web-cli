@@ -1,12 +1,24 @@
 {
   "name": "whatsapp-web-cli",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Local WhatsApp Web CLI and Codex skill with guided setup and persistent login",
   "license": "MIT",
-  "repository": {"type": "git", "url": "https://github.com/SagaBuild/whatsapp-web-cli.git"},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SagaBuild/whatsapp-web-cli.git"
+  },
   "homepage": "https://github.com/SagaBuild/whatsapp-web-cli#readme",
-  "bugs": {"url": "https://github.com/SagaBuild/whatsapp-web-cli/issues"},
-  "keywords": ["whatsapp", "whatsapp-web", "cli", "codex", "playwright", "browser-automation"],
+  "bugs": {
+    "url": "https://github.com/SagaBuild/whatsapp-web-cli/issues"
+  },
+  "keywords": [
+    "whatsapp",
+    "whatsapp-web",
+    "cli",
+    "codex",
+    "playwright",
+    "browser-automation"
+  ],
   "private": true,
   "type": "module",
   "engines": {
@@ -20,7 +32,17 @@
     "release:check": "node scripts/check-release.mjs",
     "wa": "node scripts/wa.mjs"
   },
-  "files": ["SKILL.md", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "runtime-files.json", "agents/openai.yaml", "references", "docs", "scripts"],
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "runtime-files.json",
+    "agents/openai.yaml",
+    "references",
+    "docs",
+    "scripts"
+  ],
   "dependencies": {
     "@playwright/cli": "0.1.19"
   }

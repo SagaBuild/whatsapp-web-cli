@@ -63,6 +63,18 @@ test('Install-only setup does not open WhatsApp; help has no side effects',async
   await assert.rejects(setup(['--timeout=-1'],deps),{code:'BAD_ARGUMENT'});
 });
 
+test('Successful setup forwards the requested session, timeout and cancellation signal to onboarding',async()=>{
+  const signal=new AbortController().signal,events=[],received=[];
+  const result=await setup(['--session','separate-account','--timeout','60','--destination','synthetic-destination'],{
+    signal,emit:message=>events.push(message),check:async()=>{},
+    install:async({destination,emit})=>{assert.equal(destination,'synthetic-destination');emit('installed');return {skillDirectory:'/synthetic/skill'};},
+    onboard:async(options,{emit})=>{received.push(options);emit('linked');return {ready:true,session:options.session};}
+  });
+  assert.deepEqual(received,[{session:'separate-account',timeoutMs:60000,signal}]);
+  assert.equal(result.session,'separate-account');assert.equal(result.ready,true);
+  assert.equal(result.skillDirectory,'/synthetic/skill');assert.deepEqual(events,['installed','linked']);
+});
+
 async function loginFixture(t,authenticated){
   const scratch=fileURLToPath(new URL('../.work/setup-tests/',import.meta.url));
   await fs.mkdir(scratch,{recursive:true});

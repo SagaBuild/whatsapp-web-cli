@@ -39,5 +39,8 @@
   "tests/release.test.mjs",
   "tests/setup.test.mjs",
   "tests/storage.test.mjs",
-  "tests/transport.test.mjs"
+  "tests/transport.test.mjs",
+  "docs/testing.md",
+  "tests/cli-workflows.test.mjs",
+  "tests/helpers/browser-fixture.mjs"
 ]

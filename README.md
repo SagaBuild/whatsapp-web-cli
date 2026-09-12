@@ -92,7 +92,7 @@ npm ci --ignore-scripts
 npm run verify
 ```
 
-`npm test` shows individual checks; `npm run release:check` checks the public file inventory. Tests cover original download bytes, Unicode filenames, profile persistence, installation, exact chat selection, draft changes and uncertain-send recovery.
+`npm test` shows individual checks; `npm run release:check` checks the public file inventory. Tests exercise complete CLI workflows, exact file bytes, interrupted upload recovery, persistent browser state, installation and release rejection. See the [testing guide](docs/testing.md) for evidence boundaries and contribution expectations.
 
 Use the [bug report](https://github.com/SagaBuild/whatsapp-web-cli/issues/new?template=bug_report.yml) or [feature request](https://github.com/SagaBuild/whatsapp-web-cli/issues/new?template=feature_request.yml) forms. Contributions and synthetic reproductions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) before sharing diagnostics.
 

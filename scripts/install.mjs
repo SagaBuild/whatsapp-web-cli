@@ -7,7 +7,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {parseArgs} from 'node:util';
 import {fail,withLock} from './storage.mjs';
-import {executeNode,npmEntry,samePath,isMain} from './platform.mjs';
+import {executeNode,npmEntry,samePath,isMain,checkCliHealth} from './platform.mjs';
 
 const sourceRoot=fileURLToPath(new URL('../',import.meta.url));
 const marker='.whatsapp-web-managed';
@@ -36,6 +36,18 @@ async function installedVersionsMatch(destination,packages){
     if(!installed||installed.version!==expected.version)return false;
   }
   return true;
+}
+
+async function canonicalDestination(destination){
+  // Existing aliases must share one lock; for a fresh destination resolve its
+  // nearest existing parent before adding the missing path components.
+  try{return await fs.realpath(destination);}
+  catch(error){
+    if(error.code!=='ENOENT')throw error;
+    const parent=path.dirname(destination);
+    if(parent===destination)throw error;
+    return path.join(await canonicalDestination(parent),path.basename(destination));
+  }
 }
 
 async function validateDestinationFile(destination,target,{same=false}={}){
@@ -94,7 +106,7 @@ export async function installSkill({source=sourceRoot,destination,emit=()=>{}}={
     const relative=path.relative(destination,source);
     if(!relative.startsWith('..')&&!path.isAbsolute(relative))throw fail('INSTALL_DESTINATION','The destination cannot contain the source checkout.');
   }
-  return withLock(destination+'.install.lock',async()=>{
+  return withLock((await canonicalDestination(destination))+'.install.lock',async()=>{
     const markerFile=path.join(destination,marker);
     if(!same&&await exists(destination)&&!await exists(markerFile))throw fail('UNMANAGED_INSTALL','The destination already exists and is not managed by this installer. Choose another --destination.');
     // Validate every target before closing a browser or replacing any installed code.
@@ -107,12 +119,25 @@ export async function installSkill({source=sourceRoot,destination,emit=()=>{}}={
     const installedFingerprint=managed?.schemaVersion===1?managed.dependencyFingerprint
       :dependencyFingerprint(dependencyPackages(await readJson(path.join(destination,'node_modules','.package-lock.json'))));
     const cli=path.join(destination,'node_modules','@playwright','cli','playwright-cli.js');
-    const needsDependencies=!await exists(cli)||installedFingerprint!==wantedFingerprint||!await installedVersionsMatch(destination,packages);
+    let healthy=false;
+    if(await exists(cli)){
+      const installedCli=await readJson(path.join(destination,'node_modules/@playwright/cli/package.json'));
+      try{await checkCliHealth(cli,{execute:dependencies.execute,cwd:destination,expectedVersion:installedCli?.version});healthy=true;}
+      catch(error){if(error.code!=='CLI_UNHEALTHY')throw error;}
+    }
+    const needsDependencies=!healthy||installedFingerprint!==wantedFingerprint||!await installedVersionsMatch(destination,packages);
     // Resolve npm before changing a healthy installed copy or closing its browser.
     const npm=needsDependencies?await dependencies.npm():null;
-    if(!same&&needsDependencies&&await exists(markerFile)&&await exists(cli)){
+    if(needsDependencies&&await exists(markerFile)){
+      let closeRoot=destination,closeCli=cli;
+      if(!healthy){
+        closeRoot=source;closeCli=path.join(source,'node_modules','@playwright','cli','playwright-cli.js');
+        // A broken destination cannot confirm shutdown. The source backend can
+        // close the same runtime/profile without importing the damaged package.
+        await checkCliHealth(closeCli,{execute:dependencies.execute,cwd:source,expectedVersion:packages['node_modules/@playwright/cli']?.version});
+      }
       emit('Updating browser dependencies; closing the managed browser while retaining its profile.');
-      await dependencies.execute([path.join(destination,'scripts','wa.mjs'),'close'],{cwd:destination});
+      await dependencies.execute([path.join(closeRoot,'scripts','wa.mjs'),'close'],{cwd:closeRoot,env:{...process.env,WA_PLAYWRIGHT_CLI:closeCli}});
     }
     await fs.mkdir(destination,{recursive:true});
     const state={schemaVersion:1,version:pkg.version,dependencyFingerprint:wantedFingerprint};
@@ -127,6 +152,8 @@ export async function installSkill({source=sourceRoot,destination,emit=()=>{}}={
       emit('Installing the pinned browser dependency.');
       await dependencies.execute([npm,'ci','--ignore-scripts','--no-audit','--no-fund'],{cwd:destination});
       if(!await exists(cli)||!await installedVersionsMatch(destination,packages))throw fail('INSTALL_DEPENDENCIES','The installed browser dependency versions could not be verified. Run setup again to repair them.');
+      try{await checkCliHealth(cli,{execute:dependencies.execute,cwd:destination,expectedVersion:packages['node_modules/@playwright/cli']?.version});}
+      catch(error){throw fail('INSTALL_DEPENDENCIES','The installed browser dependency could not run. Run setup again to repair it.',{causeCode:error.code});}
     }
     // Browser/Chrome readiness is separate from a completed npm installation.
     // Preserve that evidence if doctor fails so a retry need not reset dependencies.

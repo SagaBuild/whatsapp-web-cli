@@ -7,12 +7,12 @@ import { constants } from 'node:fs';
 import { browserAction } from './browser.mjs';
 import { settings, findCli, runCli, act, snapshot, sessionInfo, openBrowser, closeBrowser, recoverClosedBrowser } from './transport.mjs';
 import { fail, withLock, saveDownload, safeFilename, hashFile } from './storage.mjs';
-import { checkRequirements, samePath, isMain } from './platform.mjs';
+import { checkRequirements, checkCliHealth, samePath, isMain } from './platform.mjs';
 
 const help={
   usage:'node <skill>/scripts/wa.mjs COMMAND [OPTIONS]',
   commands:{
-    doctor:'Check runtime and absolute session paths.',
+    doctor:'Check Node, Chrome, executable browser dependency health and absolute session paths. Does not open a browser.',
     open:'Open the persistent linked Chrome profile in the background. --headed shows a desktop window. An existing browser is reused without restarting.',
     status:'Return login state and the currently selected chat.',
     close:'Close this browser; retain the profile and login.',
@@ -95,7 +95,11 @@ export async function main(argv,backend={settings,findCli,runCli,act,snapshot,se
   for(const option of Object.keys(o))if(!['session','help',...allowed[command]].includes(option))throw fail('BAD_ARGUMENT',`--${option} is not supported by ${command}.`);
   if(command!=='ui'&&pos.length)throw fail('BAD_ARGUMENT',`Unexpected positional arguments for ${command}.`);
   const config=settings(o.session);
-  if(command==='doctor')return {...await checkRequirements(),backend:await findCli(),...config};
+  if(command==='doctor'){
+    const requirements=await checkRequirements(),entry=await findCli();
+    const health=await checkCliHealth(entry);
+    return {...requirements,backend:entry,backendVersion:health.version,...config};
+  }
   return withLock(config.lock,async()=>{
     const call=(op,args={})=>act(config,browserAction,op,args);
     const preparedFile=path.join(config.base,'prepared-draft.json');
@@ -200,7 +204,10 @@ export async function main(argv,backend={settings,findCli,runCli,act,snapshot,se
     }
     if(command==='upload') {
       const originals=await files(), pendingFile=path.join(config.base,'pending-upload.json');
-      const state=(await runCli(config,['snapshot'])).stdout;
+      // The pinned backend rejects snapshots while a file chooser is open.
+      // Read-only tab metadata still reports modal state, allowing a bound
+      // interrupted upload to resume without discarding its prepared files.
+      const state=(await runCli(config,['tab-list'])).stdout;
       let pending=await readState(pendingFile);
       const matching=pending && pending.chat===o.chat && JSON.stringify(pending.originals)===JSON.stringify(originals);
       if(matching && !/\[File chooser\]/.test(state)) {

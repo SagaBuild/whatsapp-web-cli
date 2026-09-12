@@ -33,6 +33,8 @@ before(async()=>{
   server=createServer((req,res)=>{
     if(req.url==='/zip'){res.writeHead(200,{'Content-Type':'application/zip','Content-Disposition':"attachment; filename*=UTF-8''%E6%8C%AA%E5%A8%81%E8%AF%AD.zip"});res.end(zip);}
     else if(req.url==='/png'){res.writeHead(200,{'Content-Type':'image/png'});res.end(png);}
+    else if(req.url==='/slow-download'){res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="slow.bin"','Content-Length':'1000000'});res.write('incomplete local payload');req.on('close',()=>res.destroy());}
+    else if(req.url?.startsWith('/linked?')){res.writeHead(200,{'Content-Type':'text/html'});res.end('<!doctype html><title>Local linked page</title><p>Observed link destination</p>');}
     else {res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end(html);}
   });
   await new Promise(r=>server.listen(0,'127.0.0.1',r));url=`http://127.0.0.1:${server.address().port}/`;
@@ -41,13 +43,16 @@ before(async()=>{
 });
 after(async()=>{await browser?.close();if(server)await new Promise(r=>server.close(r));assert.equal(path.dirname(root),path.resolve(scratch));await fs.rm(root,{recursive:true,force:true});});
 async function fixture(){const context=await browser.newContext({acceptDownloads:true});const page=await context.newPage();await page.goto(url);return {page,close:()=>context.close(),run:(op,args={})=>browserAction(page,op,{fixture:true,chat:'Team A',...args})};}
+async function selectedFileBytes(page){return Buffer.from(await page.locator('input[type="file"]').evaluate(async input=>Array.from(new Uint8Array(await input.files[0].arrayBuffer()))));}
 
 test('Exact chat identity and duplicates are checked before actions',async()=>{
   const f=await fixture();try{
     await assert.rejects(f.run('chat',{name:'Duplicate'}),{code:'AMBIGUOUS_CHAT'});
     await assert.rejects(f.run('compose',{chat:'Someone else',text:'wrong'}),{code:'WRONG_CHAT'});
     assert.equal(await f.page.locator('footer [contenteditable]').innerText(),'');
+    await f.page.locator('#main header').evaluate(e=>e.textContent='Team B');
     assert.equal((await f.run('chat',{name:'Team A'})).chat,'Team A');
+    assert.equal(await f.page.locator('#main header').innerText(),'Team A');
   }finally{await f.close();}
 });
 
@@ -84,9 +89,10 @@ test('Compose preserves existing drafts, does not send; explicit send creates ou
   }finally{await f.close();}
 });
 
-test('Upload stages original file without sending',async()=>{
+test('Upload stages original bytes without sending',async()=>{
   const f=await fixture(),dir=await fs.mkdtemp(path.join(root,'upload-')),file=path.join(dir,'local.txt');await fs.writeFile(file,'local test');try{
     await f.run('upload',{files:[file]});
+    assert.deepEqual(await selectedFileBytes(f.page),Buffer.from('local test'));
     assert.equal((await f.run('verify-upload',{files:[file]})).sent,false);
     assert.equal(await f.page.locator('#preview').innerText(),'local.txt');
     assert.equal(await f.page.evaluate(()=>window.sent),0);
@@ -342,5 +348,194 @@ test('Send preserves the persisted baseline and stops before clicking if its lat
     const result=await f.run('send',{authorized:true,expected});
     assert.equal(result.status,'outgoing_message_observed');assert.deepEqual(result.messages.map(message=>message.messageId),['out-1']);
     assert.equal(await f.page.evaluate(()=>window.sent),1);
+  }finally{await f.close();}
+});
+
+test('Chat search updates the loaded result set and reports a missing exact match',async()=>{
+  const f=await fixture();try{
+    await f.page.locator('#side input').evaluate(input=>{
+      const rows=Array.from(document.querySelectorAll('#pane-side [role="row"]'));
+      input.oninput=()=>{const query=input.value;setTimeout(()=>document.querySelector('#pane-side').replaceChildren(...rows.filter(row=>row.textContent.includes(query))),100);};
+    });
+    const duplicates=await f.run('chats',{query:'Duplicate'});
+    assert.equal(await f.page.locator('#side input').inputValue(),'Duplicate');
+    assert.deepEqual(duplicates.chats.map(chat=>chat.title),['Duplicate','Duplicate']);
+    assert.equal(duplicates.coverage,'loaded_search_results_only');
+    assert.deepEqual((await f.run('chats',{query:'Team A'})).chats.map(chat=>chat.title),['Team A']);
+    await assert.rejects(f.run('chat',{name:'Missing team'}),{code:'CHAT_NOT_FOUND'});
+    assert.equal(await f.page.locator('#main header').innerText(),'Team A');
+  }finally{await f.close();}
+});
+
+test('History scrolling loads older rows through the known and fallback scrollers',async()=>{
+  for(const fallback of [false,true]){
+    const f=await fixture();try{
+      await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(async(list,fallback)=>{
+        list.id='history';if(fallback)list.removeAttribute('data-testid');
+        const spacer=document.createElement('div');spacer.style.height='1200px';list.prepend(spacer);list.scrollTop=list.scrollHeight;
+        await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+        list.addEventListener('scroll',()=>{if(list.scrollTop===0&&!document.querySelector('[data-id="older"]'))list.insertAdjacentHTML('afterbegin','<div data-id="older"><span data-testid="selectable-text">Older message</span></div>');});
+      },fallback);
+      assert.ok(await f.page.locator('#history').evaluate(list=>list.scrollTop>0));
+      const result=await f.run('messages',{older:1});
+      assert.deepEqual(result.messages.map(message=>message.id),['older','doc1','photo1','link1']);
+      assert.equal(result.scrolls,1);assert.equal(result.totalCollected,4);assert.equal(result.complete,false);
+      assert.equal(await f.page.locator('#history').evaluate(list=>list.scrollTop),0);
+    }finally{await f.close();}
+  }
+});
+
+test('Message limits preserve latest order and report the collected total',async()=>{
+  const f=await fixture();try{
+    const result=await f.run('messages',{limit:2});
+    assert.deepEqual(result.messages.map(message=>message.id),['photo1','link1']);
+    assert.equal(result.totalCollected,3);assert.equal(result.complete,false);
+    assert.deepEqual((await f.run('messages',{limit:1})).messages.map(message=>message.id),['link1']);
+  }finally{await f.close();}
+});
+
+test('An incoming exact echo cannot confirm an outgoing send',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'text',chat:'Team A',text:'An exact echo'};
+    await f.run('compose',{text:expected.text});
+    const baseline=await f.run('prepare-send',{authorized:true,expected});
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(list=>list.insertAdjacentHTML('beforeend','<div data-id="incoming-echo" class="message-in"><span data-testid="selectable-text">An exact echo</span></div>'));
+    assert.equal((await f.run('send-check',{expected,...baseline})).status,'send_unresolved');
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(list=>list.insertAdjacentHTML('beforeend','<div data-id="outgoing-echo" class="message-out"><span data-testid="selectable-text">An exact echo</span></div>'));
+    assert.deepEqual((await f.run('send-check',{expected,...baseline})).messages.map(message=>message.messageId),['outgoing-echo']);
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+  }finally{await f.close();}
+});
+
+test('A non-WhatsApp origin is rejected before reading or changing a draft',async()=>{
+  const f=await fixture();try{
+    await assert.rejects(f.run('status',{fixture:false}),{code:'WRONG_ORIGIN'});
+    await assert.rejects(f.run('compose',{fixture:false,text:'Must not be entered'}),{code:'WRONG_ORIGIN'});
+    assert.equal(await f.page.locator('footer [contenteditable]').innerText(),'');
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+  }finally{await f.close();}
+});
+
+test('A chat change after one Send click leaves the attempt uncertain',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'text',chat:'Team A',text:'Prepared outgoing'};await f.run('compose',{text:expected.text});
+    await f.page.evaluate(()=>{window.send=()=>{window.sent++;document.querySelector('#main header').textContent='Team B';document.querySelector('[data-testid="conversation-panel-messages"]').insertAdjacentHTML('beforeend','<div data-id="during-chat-change" class="message-out"><span data-testid="selectable-text">Prepared outgoing</span></div>');};});
+    await assert.rejects(f.run('send',{authorized:true,expected}),{code:'SEND_UNCERTAIN'});
+    assert.equal(await f.page.evaluate(()=>window.sent),1);assert.equal(await f.page.locator('#main header').innerText(),'Team B');
+  }finally{await f.close();}
+});
+
+test('A valid prepared draft still requires explicit Send authorization',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'text',chat:'Team A',text:'Ready but not authorized'};
+    await f.run('compose',{text:expected.text});
+    await f.run('prepare-send',{authorized:true,expected});
+    await assert.rejects(f.run('send',{expected}),{code:'SEND_AUTHORIZATION'});
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
+    assert.equal(await f.page.locator('footer [contenteditable]').innerText(),expected.text);
+    assert.equal((await f.run('send',{authorized:true,expected})).status,'outgoing_message_observed');
+    assert.equal(await f.page.evaluate(()=>window.sent),1);
+  }finally{await f.close();}
+});
+
+test('Connection reports login, loading and ready states and waits for readiness',async()=>{
+  const f=await fixture();try{
+    assert.equal((await f.run('status')).chat,'Team A');
+    await f.page.setContent('<p>Scan to log in</p>');
+    assert.deepEqual(await f.run('status'),{authenticated:false,chat:null,url:f.page.url(),state:'login_required'});
+    await assert.rejects(f.run('compose',{text:'Unavailable'}),{code:'LOGIN_REQUIRED'});
+    await f.page.setContent('<p>Loading application</p>');
+    assert.deepEqual(await f.run('connection'),{authenticated:false,url:f.page.url(),state:'loading'});
+    await f.page.evaluate(()=>setTimeout(()=>{const side=document.createElement('div');side.id='side';document.body.append(side);},200));
+    assert.deepEqual(await f.run('connection',{wait:true}),{authenticated:true,url:f.page.url(),state:'ready'});
+  }finally{await f.close();}
+});
+
+test('Open-link navigates an observed URL in a new tab and rejects an unobserved URL',async()=>{
+  const f=await fixture();try{
+    const observed=new URL('linked?item=42#details',url).href,unobserved=new URL('unobserved',url).href;
+    await f.page.locator('[data-id="link1"] a').evaluate((link,href)=>link.href=href,observed);
+    await assert.rejects(f.run('open-link',{url:unobserved}),{code:'LINK_NOT_OBSERVED'});
+    assert.equal(f.page.context().pages().length,1);
+    assert.deepEqual(await f.run('open-link',{url:observed}),{url:observed,opened:true});
+    const pages=f.page.context().pages();assert.equal(pages.length,2);
+    assert.equal(pages[1].url(),observed);assert.equal(await pages[1].title(),'Local linked page');
+    assert.equal(f.page.url(),url);
+  }finally{await f.close();}
+});
+
+test('Upload opens the attachment menu and stages original bytes through a real file chooser',async()=>{
+  const f=await fixture(),file=path.join(root,'chooser-original.txt');await fs.writeFile(file,'Original through chooser');try{
+    await f.page.evaluate(()=>{
+      document.querySelector('input[type="file"]').setAttribute('accept','text/plain');window.attachClicks=0;window.documentClicks=0;
+      const menu=document.createElement('button');menu.setAttribute('role','menuitem');menu.textContent='Document';menu.hidden=true;
+      menu.onclick=()=>{window.documentClicks++;document.querySelector('input[type="file"]').click();};document.body.append(menu);
+      const attach=document.createElement('button');attach.setAttribute('aria-label','Attach');attach.textContent='Attach';attach.onclick=()=>{window.attachClicks++;menu.hidden=false;};document.querySelector('#main footer').append(attach);
+    });
+    const pending=f.page.waitForEvent('filechooser',{timeout:5000});pending.catch(()=>{});
+    assert.deepEqual(await f.run('upload',{files:[file]}),{fileChooserPending:true});
+    const chooser=await pending;await chooser.setFiles([file]);
+    assert.deepEqual(await selectedFileBytes(f.page),Buffer.from('Original through chooser'));
+    assert.equal((await f.run('verify-upload',{files:[file]})).status,'files_staged');
+    assert.deepEqual(await f.page.evaluate(()=>[window.attachClicks,window.documentClicks,window.sent]),[1,1,0]);
+  }finally{await f.close();}
+});
+
+test('Missing download events are reported after one activation without saving a file',async()=>{
+  const f=await fixture(),savePath=path.join(root,'missing-download.zip');try{
+    await f.page.locator('[data-id="doc1"]').evaluate(row=>{window.downloadClicks=0;row.innerHTML='<button aria-label="Download attachment">Download</button>';row.querySelector('button').onclick=()=>window.downloadClicks++;});
+    await assert.rejects(f.run('download',{message:'doc1',savePath,timeout:250}),{code:'DOWNLOAD_UNCONFIRMED'});
+    assert.equal(await f.page.evaluate(()=>window.downloadClicks),1);
+    await assert.rejects(fs.stat(savePath),{code:'ENOENT'});
+  }finally{await f.close();}
+});
+
+test('A canceled browser download is reported as failed and leaves no saved file',async()=>{
+  const f=await fixture(),savePath=path.join(root,'canceled-download.bin');try{
+    await f.page.locator('[data-id="doc1"] a').evaluate(link=>{link.href='/slow-download';link.download='slow.bin';});
+    const cancellation=f.page.waitForEvent('download',{timeout:5000}).then(download=>download.cancel());cancellation.catch(()=>{});
+    await assert.rejects(f.run('download',{message:'doc1',savePath,timeout:5000}),{code:'DOWNLOAD_FAILED'});
+    await cancellation;await assert.rejects(fs.stat(savePath),{code:'ENOENT'});
+  }finally{await f.close();}
+});
+
+test('Ambiguous media download controls are not activated and the viewer is closed',async()=>{
+  const f=await fixture(),savePath=path.join(root,'ambiguous-download.png');try{
+    await f.page.locator('#viewer').evaluate(viewer=>{
+      window.downloadClicks=0;const existing=viewer.querySelector('[aria-label="Download"]');existing.onclick=()=>window.downloadClicks++;
+      const extra=existing.cloneNode(true);extra.onclick=()=>window.downloadClicks++;viewer.append(extra);
+    });
+    await assert.rejects(f.run('download',{message:'photo1',savePath,timeout:5000}),{code:'DOWNLOAD_AMBIGUOUS'});
+    assert.equal(await f.page.evaluate(()=>window.downloadClicks),0);
+    assert.equal(await f.page.locator('#viewer').isVisible(),false);await assert.rejects(fs.stat(savePath),{code:'ENOENT'});
+  }finally{await f.close();}
+});
+
+test('File sends preserve significant filename whitespace through outgoing confirmation',async()=>{
+  for(const name of [' report.pdf','report  final.pdf','report\u00a0final.pdf']){
+    const f=await fixture();try{
+      await f.page.evaluate(name=>previewFiles([{name}]),name);
+      assert.equal((await f.run('verify-upload',{files:[name],quick:true})).status,'files_staged');
+      const result=await f.run('send',{authorized:true,expected:{kind:'files',chat:'Team A',names:[name]}});
+      assert.equal(result.status,'outgoing_message_observed');assert.equal(await f.page.evaluate(()=>window.sent),1);
+      assert.deepEqual((await f.run('messages')).messages.at(-1).documentNames,[name]);
+    }finally{await f.close();}
+  }
+});
+
+test('Send checks require exact raw filenames and ignore hidden filename text',async()=>{
+  const f=await fixture();try{
+    const expected={kind:'files',chat:'Team A',names:['report.pdf']};
+    await f.page.evaluate(()=>previewFiles([{name:'report.pdf'}]));
+    const baseline=await f.run('prepare-send',{authorized:true,expected});
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(list=>{
+      list.insertAdjacentHTML('beforeend','<div data-id="whitespace-impostor" class="message-out"><span data-testid="document-thumb"> report.pdf</span></div><div data-id="hidden-name" class="message-out"><span data-testid="document-thumb"><span hidden>report.pdf<br></span>other.pdf</span></div>');
+    });
+    assert.equal((await f.run('send-check',{expected,...baseline})).status,'send_unresolved');
+    assert.deepEqual((await f.run('messages')).messages.at(-1).documentNames,['other.pdf']);
+    await f.page.locator('[data-testid="conversation-panel-messages"]').evaluate(list=>list.insertAdjacentHTML('beforeend','<div data-id="exact-name" class="message-out"><span data-testid="document-thumb">report.pdf</span></div>'));
+    const confirmed=await f.run('send-check',{expected,...baseline});assert.equal(confirmed.status,'outgoing_message_observed');
+    assert.deepEqual(confirmed.messages.map(message=>message.messageId),['exact-name']);
+    assert.equal(await f.page.evaluate(()=>window.sent),0);
   }finally{await f.close();}
 });

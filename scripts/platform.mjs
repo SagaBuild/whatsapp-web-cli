@@ -58,6 +58,17 @@ export async function executeNode(args,{cwd,env=process.env,timeout=180000}={}) 
   });
 }
 
+export async function checkCliHealth(cli,{execute=executeNode,cwd,env=process.env,expectedVersion}={}) {
+  try {
+    const result=await execute([cli,'--version'],{cwd,env:{...env,NO_UPDATE_NOTIFIER:'1'},timeout:15000});
+    const version=result.stdout.trim();
+    if(!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)||expectedVersion&&version!==expectedVersion)throw Error('Unexpected dependency version');
+    return {cli,version};
+  } catch(error) {
+    throw fail('CLI_UNHEALTHY','The browser dependency could not execute its version check. Run setup from a healthy source checkout to repair it.',{causeCode:error.code});
+  }
+}
+
 export async function npmEntry({env=process.env,execPath=process.execPath,platform=process.platform,realpath=fs.realpath,isFile=async file=>{try{return (await fs.stat(file)).isFile();}catch{return false;}}}={}) {
   const paths=platform==='win32'?path.win32:path.posix;
   const candidates=[env.npm_execpath],executables=[execPath];

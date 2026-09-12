@@ -116,9 +116,10 @@ export async function saveDownload(directory, source, download) {
       } catch(e) { if(e.code!=='ENOENT') throw e; }
     }
     const temporary = path.join(directory,`.wa-part-${randomUUID()}`);
+    let staging,target,created,content,committed=false;
     try {
       const result = await download(temporary);
-      const content = await hashFile(temporary);
+      content = await hashFile(temporary);
       if (!content.bytes) throw fail('EMPTY_DOWNLOAD','Download produced an empty file.');
       const originalFilename = result.filename || 'attachment';
       let wanted = safeFilename(originalFilename);
@@ -126,20 +127,41 @@ export async function saveDownload(directory, source, download) {
       // no manifest has been written yet. These names must never become payloads.
       if(/^wa-manifest\.json$/i.test(wanted)||/^\.wa-/i.test(wanted))wanted=`_${wanted}`;
       const ext = path.extname(wanted), stem = wanted.slice(0,wanted.length-ext.length);
-      let savedFilename, target;
+      let savedFilename;
       for(let i=0;i<1000;i++) {
         savedFilename = i ? `${stem} (${i})${ext}` : wanted;
         target = path.join(directory,savedFilename);
-        try { await fs.copyFile(temporary,target,constants.COPYFILE_EXCL); break; }
+        try {
+          await fs.copyFile(temporary,target,constants.COPYFILE_EXCL);
+          created=await fs.lstat(target,{bigint:true});
+          break;
+        }
         catch(e) { if(e.code!=='EEXIST') throw e; if(i===999) throw fail('NAME_COLLISIONS','Too many files with the same name.'); }
       }
       const receipt = { key, ...source, originalFilename, savedFilename, path:target, ...content,
         savedAt:new Date().toISOString(), observed:result.observed || null };
       manifest.files.push(receipt);
-      const staging = path.join(directory,`.wa-manifest-${randomUUID()}.tmp`);
+      staging = path.join(directory,`.wa-manifest-${randomUUID()}.tmp`);
       await fs.writeFile(staging,JSON.stringify(manifest,null,2)+'\n',{flag:'wx'});
       await fs.rename(staging,path.join(directory,'wa-manifest.json'));
+      committed=true;
       return {...receipt,status:'saved'};
-    } finally { await fs.rm(temporary,{force:true}); }
+    } catch(error) {
+      // Only roll back the new copy we still own. Existing collision files and
+      // files replaced or edited by someone else must remain intact.
+      if(created&&!committed){
+        try {
+          const current=await fs.lstat(target,{bigint:true});
+          if(current.isFile()&&!current.isSymbolicLink()&&current.dev===created.dev&&current.ino===created.ino){
+            const actual=await hashFile(target);
+            if(actual.bytes===content.bytes&&actual.sha256===content.sha256)await fs.unlink(target);
+          }
+        } catch(cleanup) { if(cleanup.code!=='ENOENT')error.details={...error.details,uncommittedFile:target,cleanupCode:cleanup.code}; }
+      }
+      throw error;
+    } finally {
+      await fs.rm(temporary,{force:true});
+      if(staging)await fs.rm(staging,{force:true});
+    }
   });
 }

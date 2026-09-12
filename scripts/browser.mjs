@@ -77,21 +77,29 @@ export async function browserAction(page, op, a) {
     const body=Array.from(el.querySelectorAll('span[data-testid="selectable-text"],span.selectable-text')).find(own)||el;
     const copy=body.cloneNode(true);
     for(const node of copy.querySelectorAll(quoteSelector+', [data-testid="msg-meta"], [data-icon], [data-testid="document-thumb"]'))node.remove();
-    const plain=node=>{
+    const plain=(node,rendered=false)=>{
       if(node.nodeType===3)return node.textContent;
+      if(rendered&&node.nodeType===1){
+        const style=getComputedStyle(node);
+        if(style.display==='none'||style.visibility==='hidden'||style.visibility==='collapse')return '';
+      }
       if(node.nodeName==='IMG')return node.getAttribute('alt')||'';
       if(node.nodeName==='BR')return '\n';
       let text='';
       for(const child of node.childNodes){
+        const content=plain(child,rendered);
+        if(rendered&&!content)continue;
         const block=/^(DIV|P)$/.test(child.nodeName);
         if(block&&text&&!text.endsWith('\n'))text+='\n';
-        text+=plain(child);
+        text+=content;
         if(block&&child.nextSibling&&!text.endsWith('\n'))text+='\n';
       }
       return text;
     };
     const messageText=plain(copy).replace(/\r\n?/g,'\n').replace(/\u00a0/g,' ').trim();
-    const documentNames=Array.from(el.querySelectorAll('[data-testid="document-thumb"]')).filter(own).map(e=>e.innerText.split('\n')[0].trim()).filter(Boolean);
+    // Filename whitespace is significant. Preserve raw text from rendered
+    // nodes; innerText and trim() can turn distinct filenames into one match.
+    const documentNames=Array.from(el.querySelectorAll('[data-testid="document-thumb"]')).filter(own).map(e=>plain(e,true).split('\n')[0]).filter(Boolean);
     return {id:el.getAttribute('data-id'),rawTimestampAndSender:pre,messageText,documentNames,
       direction:outgoing?'outgoing':'unknown',delivery,rawDelivery,
       displayedTime:(el.innerText.match(/\b\d{1,2}:\d{2}\b/g)||[]).at(-1)||null,

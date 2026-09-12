@@ -12,6 +12,8 @@ node $wa links --chat 'Team chat'
 node $wa download --chat 'Team chat' --message 'ID_FROM_MESSAGES' --item 0 --out 'C:/Project/input'
 ```
 
+`node $wa doctor` checks Node, Chrome and whether the browser backend can actually execute its version command. It does not open WhatsApp. `CLI_UNHEALTHY` means the dependency cannot run; update from a healthy source checkout with its dependencies installed, then run setup to repair the installed copy while retaining the configured profile.
+
 `open` starts in the background and reuses an existing session without changing its mode. `status` includes `headed:false` when no desktop window is shown. After linking in setup, run `close` then `open` for background use. To inspect manually, finish pending previews, run `close`, then `open --headed`. Both modes use the same login. A mode change restarts Chrome and can discard an unsent attachment preview.
 
 `--older` is bounded (0–50). Repeated calls continue from the current scroll position. Dates displayed by WhatsApp can be locale-dependent; do not reinterpret them without context. Photos/documents without full date metadata return the available time only. No command guarantees complete history. A grouped album may require UI inspection to reveal additional items. View-once/disappearing or unavailable media may not be downloadable.

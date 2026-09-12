@@ -31,6 +31,59 @@ test('Downloads deduplicate by actual hash, preserve collisions, and repair corr
   const other=await saveDownload(out,{...source,messageId:'m2'},get);assert.notEqual(other.path,repair.path);
 });
 
+test('SHA-256 receipts use a fixed known digest and detect equal-length corruption',async()=>{
+  const out=await fs.mkdtemp(path.join(root,'same-size-')),known=path.join(out,'known.txt');
+  await fs.writeFile(known,'abc');
+  assert.deepEqual(await hashFile(known),{bytes:3,sha256:'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'});
+  let downloads=0;
+  const source={messageId:'same-size'},download=async file=>{downloads++;await fs.writeFile(file,'original bytes');return {filename:'payload.txt'};};
+  const first=await saveDownload(out,source,download);
+  await fs.writeFile(first.path,'modified bytes');
+  assert.equal((await fs.stat(first.path)).size,first.bytes);
+  const repaired=await saveDownload(out,source,download);
+  assert.equal(repaired.status,'saved');assert.equal(downloads,2);
+  assert.notEqual(repaired.path,first.path);
+  assert.equal(await fs.readFile(repaired.path,'utf8'),'original bytes');
+  assert.equal(await fs.readFile(first.path,'utf8'),'modified bytes');
+});
+
+for(const operation of ['write','rename'])test(`A manifest ${operation} failure rolls back only its new payload and cleans staging before retry`,async t=>{
+  const out=await fs.mkdtemp(path.join(root,'commit-failure-'));
+  const download=filename=>async file=>{await fs.writeFile(file,'synthetic bytes');return {filename};};
+  const first=await saveDownload(out,{messageId:'existing'},download('existing.txt'));
+  // saveDownload canonicalizes paths; use its returned directory on aliased /tmp volumes too.
+  const directory=path.dirname(first.path),manifest=path.join(directory,'wa-manifest.json');
+  const previous=await fs.readFile(manifest,'utf8');
+  const original=fs[operation==='write'?'writeFile':'rename'].bind(fs);
+  t.mock.method(fs,operation==='write'?'writeFile':'rename',async(...args)=>{
+    const isCommit=operation==='write'?path.basename(args[0]).startsWith('.wa-manifest-'):path.resolve(args[1])===manifest;
+    if(!isCommit)return original(...args);
+    if(operation==='write')await original(args[0],'synthetic partial manifest',args[2]);
+    throw Object.assign(Error('Synthetic manifest commit failure'),{code:operation==='write'?'ENOSPC':'EACCES'});
+  });
+  await assert.rejects(saveDownload(out,{messageId:'new'},download('new.txt')),{code:operation==='write'?'ENOSPC':'EACCES'});
+  assert.equal(await fs.readFile(manifest,'utf8'),previous);
+  assert.equal(await fs.readFile(first.path,'utf8'),'synthetic bytes');
+  assert.deepEqual((await fs.readdir(directory)).sort(),['existing.txt','wa-manifest.json']);
+  t.mock.restoreAll();
+  const retry=await saveDownload(out,{messageId:'new'},download('new.txt'));
+  assert.equal(retry.savedFilename,'new.txt');assert.equal(retry.status,'saved');
+  assert.equal(JSON.parse(await fs.readFile(manifest,'utf8')).files.length,2);
+});
+
+test('Rollback preserves a new payload that another writer changed before the commit failed',async t=>{
+  const out=await fs.mkdtemp(path.join(root,'changed-during-commit-'));
+  const rename=fs.rename.bind(fs);
+  t.mock.method(fs,'rename',async(source,target)=>{
+    if(path.basename(target)!=='wa-manifest.json')return rename(source,target);
+    await fs.writeFile(path.join(path.dirname(target),'payload.txt'),'independent writer content');
+    throw Object.assign(Error('Synthetic commit failure after an external edit'),{code:'EACCES'});
+  });
+  await assert.rejects(saveDownload(out,{messageId:'changed'},async file=>{await fs.writeFile(file,'downloaded content');return {filename:'payload.txt'};}),{code:'EACCES'});
+  assert.equal(await fs.readFile(path.join(out,'payload.txt'),'utf8'),'independent writer content');
+  assert.deepEqual(await fs.readdir(out),['payload.txt']);
+});
+
 test('Failed or empty downloads create no success receipt',async()=>{
   const out=await fs.mkdtemp(path.join(root,'failed-'));
   await assert.rejects(saveDownload(out,{messageId:'m'},async file=>{await fs.writeFile(file,'');return {filename:'empty.zip'};}),{code:'EMPTY_DOWNLOAD'});
@@ -44,6 +97,13 @@ test('A concurrent command cannot claim a live session lock',async()=>{
   const dir=await fs.mkdtemp(path.join(root,'lock-')),lock=path.join(dir,'session.lock');
   await withLock(lock,async()=>assert.rejects(withLock(lock,async()=>assert.fail('must not execute')),{code:'BUSY'}));
   assert.deepEqual(await fs.readdir(dir),[]);
+});
+
+test('Finishing a command never removes a replacement lock owner',async()=>{
+  const directory=await fs.mkdtemp(path.join(root,'lock-successor-')),lock=path.join(directory,'session.lock');
+  const successor={pid:process.pid,token:'synthetic-successor'};
+  await withLock(lock,async()=>{await fs.writeFile(lock,JSON.stringify(successor));});
+  assert.deepEqual(JSON.parse(await fs.readFile(lock,'utf8')),successor);
 });
 
 test('Long Unicode names preserve extensions within a portable byte budget',()=>{
