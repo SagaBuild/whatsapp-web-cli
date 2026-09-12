@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a WhatsApp Web workflow or CLI improvement.
+body:
+  - type: markdown
+    attributes:
+      value: Describe the workflow using fake chat names and filenames. Do not include real messages, phone numbers, login details or private attachments.
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What are you trying to do?
+      description: Explain the task and what currently gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Suggested behavior
+      description: A short command example or description is enough.
+    validations:
+      required: true

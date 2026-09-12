@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data.
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach real chats, phone numbers, profiles, QR/login codes, receipts or private screenshots/logs. Read SECURITY.md for vulnerabilities.
+  - type: input
+    id: environment
+    attributes:
+      label: Version and environment
+      description: CLI version, Node version, Chrome version and operating system. No personal paths.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Synthetic reproduction
+      description: Command shape, fake filenames/chat titles, expected result and actual error code.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Private data
+      options:
+        - label: This report contains no account data, credentials, real messages or private artifacts.
+          required: true

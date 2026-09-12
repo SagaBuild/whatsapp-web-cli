@@ -1,0 +1,30 @@
+name: Synthetic tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-15, macos-15-intel]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - name: Install Chrome for synthetic tests
+        run: npx playwright install --with-deps chrome
+      - name: Verify synthetic browser, installation and release checks
+        run: npm run verify
+      # Never upload account profiles, browser traces, screenshots or runtime artifacts.

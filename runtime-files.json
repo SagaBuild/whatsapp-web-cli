@@ -1,0 +1,9 @@
+[
+  "SKILL.md", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CONTRIBUTING.md", "SECURITY.md",
+  "package.json", "package-lock.json", "runtime-files.json",
+  "agents/openai.yaml", "references/commands.md",
+  "docs/onboarding.md", "docs/privacy.md", "docs/macos.md", "docs/assets/hero.svg",
+  "scripts/wa.mjs", "scripts/browser.mjs", "scripts/storage.mjs",
+  "scripts/transport.mjs", "scripts/platform.mjs",
+  "scripts/install.mjs", "scripts/install.ps1", "scripts/setup.mjs", "scripts/verify.mjs"
+]

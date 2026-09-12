@@ -1,0 +1,3 @@
+interface:
+  display_name: "WhatsApp Web"
+  short_description: "Read chats and handle files through a persistent CLI"

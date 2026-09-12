@@ -1,0 +1,45 @@
+# Dependencies and generated output
+node_modules/
+.work/
+work/
+dist/
+*.tgz
+*.zip
+*.log
+
+# Local status and managed-install metadata
+STATE.md
+.whatsapp-web-managed
+*.install.lock*
+
+# Private browser/account state and selected files
+.env*
+.playwright/
+.playwright-cli/
+.wa-*
+profile/
+runtime/
+sessions/
+downloads/
+uploads/
+screenshots/
+wa-manifest.json
+prepared-draft.json
+pending-upload.json
+pending-ui.json
+send-resolutions/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.pdf
+*.har
+*.sqlite*
+Cookies*
+Local State
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
