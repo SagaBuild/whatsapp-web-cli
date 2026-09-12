@@ -153,8 +153,6 @@ test('The actual pinned CLI launches the detected Chrome and reopens only its is
       await page.locator('textarea').fill(args.text);
       return await page.locator('textarea').inputValue();
     },'fixture',{text}),text);
-    const savedStorage={local:'synthetic-local-storage',indexed:'synthetic-indexed-db'};
-    assert.deepEqual(await act(config,persistedStorage,'fixture',{write:true}),savedStorage);
     await assert.rejects(runCli(config,['run-code','async () => { throw new Error("Synthetic backend failure"); }']),{code:'BROWSER_ERROR'});
     await closeBrowser(config);
     assert.equal((await sessionInfo(config)).open,false);
@@ -163,6 +161,11 @@ test('The actual pinned CLI launches the detected Chrome and reopens only its is
     assert.equal((await sessionInfo(config)).headed,false);
     const cookies=await act(config,async page=>page.context().cookies('https://transport.fixture.test'),'fixture');
     assert.equal(cookies.find(cookie=>cookie.name==='fixture')?.value,cookieValue);
+    // Keep the original cookie-only regression separate from visiting its origin.
+    const savedStorage={local:'synthetic-local-storage',indexed:'synthetic-indexed-db'};
+    assert.deepEqual(await act(config,persistedStorage,'fixture',{write:true}),savedStorage);
+    await closeBrowser(config);
+    await open();
     assert.deepEqual(await act(config,persistedStorage,'fixture'),savedStorage);
   } finally {
     // Close while fixture registry overrides are still active; test.after restores them.

@@ -64,18 +64,32 @@ export async function openBrowser(config,{headed=false,url='https://web.whatsapp
 
 export async function closeBrowser(config,dependencies={}){
   const info=dependencies.info||sessionInfo,sleep=dependencies.sleep||delay,now=dependencies.now||Date.now;
-  const request=dependencies.request||(c=>act(c,async page=>{
-    const session=await page.context().newCDPSession(page);
-    await session.send('Browser.close');
-  },'close-browser'));
+  const request=dependencies.request||(async c=>{
+    await act(c,async page=>{
+      const context=page.context();
+      // This exact listener belongs to the pinned Playwright CLI daemon. Keep all
+      // other close listeners, including Playwright's own completion promise.
+      const listeners=context.listeners('close').filter(listener=>{
+        const source=Function.prototype.toString.call(listener);
+        return source.includes('deleteSessionFile')&&source.includes('gracefullyProcessExitDoNotHang');
+      });
+      if(listeners.length!==1)throw Object.assign(Error('The browser backend shutdown handler changed. Keep the profile and inspect compatibility before closing.'),{code:'BROWSER_CLOSE_UNSUPPORTED'});
+      context.removeListener('close',listeners[0]);
+      try{await context.close();}
+      catch(error){context.on('close',listeners[0]);throw error;}
+      return {browserClosed:true};
+    },'close-browser');
+    // Chrome has finished closing and flushing the profile; stop its idle daemon.
+    await runCli(c,['close']);
+  });
   const before=await info(config);
   if(!before.open)return {closed:true,profileRetained:true};
   if(!await samePath(before.profile,config.profile))throw fail('PROFILE_MISMATCH','Refusing to close a browser using another profile.');
   // The pinned backend's stop path can enter shutdown twice and force-kill Chrome
-  // on POSIX before cookies are flushed. Ask Chrome itself to shut down first.
+  // on POSIX before cookies are flushed. Complete context.close before daemon stop.
   let error;
   try{await request(config);}catch(e){error=e;}
-  // A successful Browser.close can disconnect the daemon before its reply arrives.
+  // Successful shutdown can disconnect the daemon before its reply arrives.
   // Confirm the result; never fall back to killing a browser with unflushed state.
   const deadline=now()+10000;
   do{
