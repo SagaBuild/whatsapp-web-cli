@@ -71,6 +71,7 @@ async function loginFixture(t,authenticated){
   const config={session:'fixture',base,profile:path.join(base,'profile'),lock:path.join(base,'command.lock')};
   const calls=[];
   const backend={sessionInfo:async()=>({open:true,profile:config.profile,headed:false}),
+    closeBrowser:async()=>{calls.push(['close']);},
     openBrowser:async(c,{headed})=>{calls.push(['open','https://web.whatsapp.com/','--browser=chrome',...(headed?['--headed']:[]),`--profile=${c.profile}`]);},
     runCli:async(_config,args)=>{calls.push(args);return {stdout:''};},
     act:async(_config,_fn,op)=>{assert.equal(op,'connection');return {authenticated};}};

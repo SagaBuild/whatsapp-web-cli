@@ -4,14 +4,14 @@ import {parseArgs} from 'node:util';
 import {setTimeout as delay} from 'node:timers/promises';
 import {installSkill} from './install.mjs';
 import {checkRequirements,samePath,isMain} from './platform.mjs';
-import {settings,findCli,sessionInfo,runCli,act,openBrowser} from './transport.mjs';
+import {settings,findCli,sessionInfo,runCli,act,openBrowser,closeBrowser} from './transport.mjs';
 import {browserAction} from './browser.mjs';
 import {fail,withLock} from './storage.mjs';
 
 export const linkInstructions='In WhatsApp on your phone, open Settings (iPhone) or the menu (Android), then Linked devices > Link a device. Scan the QR code in the official web.whatsapp.com Chrome window. Leave Stay logged in enabled if that option appears. Never paste the QR code, a login code or your browser profile into an issue or chat.';
 
-export async function openLoginWindow(config,backend={sessionInfo,runCli,act,openBrowser}){
-  const {sessionInfo,runCli,act,openBrowser}=backend;
+export async function openLoginWindow(config,backend={sessionInfo,runCli,act,openBrowser,closeBrowser}){
+  const {sessionInfo,runCli,act,openBrowser,closeBrowser}=backend;
   return withLock(config.lock,async()=>{
     const info=await sessionInfo(config);
     if(info.open){
@@ -26,7 +26,7 @@ export async function openLoginWindow(config,backend={sessionInfo,runCli,act,ope
       }
       if(info.headed!==false||state.authenticated)return {...state,reused:true,headed:info.headed};
       // An unlinked background session cannot display its QR code to the user.
-      await runCli(config,['close']);
+      await closeBrowser(config);
     }
     await openBrowser(config,{headed:true});
     return {...await act(config,browserAction,'connection',{wait:true}),reused:false,headed:true};

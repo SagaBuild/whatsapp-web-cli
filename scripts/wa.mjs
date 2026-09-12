@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { browserAction } from './browser.mjs';
-import { settings, findCli, runCli, act, snapshot, sessionInfo, openBrowser } from './transport.mjs';
+import { settings, findCli, runCli, act, snapshot, sessionInfo, openBrowser, closeBrowser } from './transport.mjs';
 import { fail, withLock, saveDownload, safeFilename, hashFile } from './storage.mjs';
 import { checkRequirements, samePath, isMain } from './platform.mjs';
 
@@ -77,8 +77,8 @@ export async function verifyFiles(prepared) {
   }
 }
 
-export async function main(argv,backend={settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser}) {
-  const {settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser}=backend;
+export async function main(argv,backend={settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser,closeBrowser}) {
+  const {settings,findCli,runCli,act,snapshot,sessionInfo,openBrowser,closeBrowser}=backend;
   const parsed=parseArgs({args:argv,allowPositionals:true,strict:true,options:{
     session:{type:'string'},chat:{type:'string'},name:{type:'string'},query:{type:'string'},
     older:{type:'string'},limit:{type:'string'},contains:{type:'string'},message:{type:'string'},item:{type:'string'},
@@ -145,7 +145,7 @@ export async function main(argv,backend={settings,findCli,runCli,act,snapshot,se
       await openBrowser(config,{headed:o.headed===true});
       return {...await call('status',{wait:true}),reused:false,profile:config.profile,headed:o.headed===true};
     }
-    if(command==='close') {if(session.open)await runCli(config,['close']);return {closed:true,loginRetained:true};}
+    if(command==='close') {if(session.open)await closeBrowser(config);return {closed:true,loginRetained:true};}
     if(!session.open)throw fail('SESSION_CLOSED','Run open to reuse the persistent WhatsApp profile.');
     if(command==='status')return {...await call('status'),headed:session.headed,pendingSend:(await readState(preparedFile))?.attempt?.at||null};
     if(command==='chats')return call('chats',{query:o.query});

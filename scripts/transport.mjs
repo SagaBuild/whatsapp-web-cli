@@ -3,8 +3,9 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fail } from './storage.mjs';
-import { dataRoot, checkRequirements } from './platform.mjs';
+import { dataRoot, checkRequirements, samePath } from './platform.mjs';
 
 const require = createRequire(import.meta.url);
 export function settings(session='whatsapp-codex') {
@@ -59,6 +60,32 @@ export async function openBrowser(config,{headed=false,url='https://web.whatsapp
       {PLAYWRIGHT_MCP_EXECUTABLE_PATH:chrome,PLAYWRIGHT_MCP_HEADLESS:String(!headed)});
   }catch(error){keep=error.code==='COMMAND_TIMEOUT';throw error;}
   finally{if(!keep)await fs.rm(file,{force:true});}
+}
+
+export async function closeBrowser(config,dependencies={}){
+  const info=dependencies.info||sessionInfo,sleep=dependencies.sleep||delay,now=dependencies.now||Date.now;
+  const request=dependencies.request||(c=>act(c,async page=>{
+    const session=await page.context().newCDPSession(page);
+    await session.send('Browser.close');
+  },'close-browser'));
+  const before=await info(config);
+  if(!before.open)return {closed:true,profileRetained:true};
+  if(!await samePath(before.profile,config.profile))throw fail('PROFILE_MISMATCH','Refusing to close a browser using another profile.');
+  // The pinned backend's stop path can enter shutdown twice and force-kill Chrome
+  // on POSIX before cookies are flushed. Ask Chrome itself to shut down first.
+  let error;
+  try{await request(config);}catch(e){error=e;}
+  // A successful Browser.close can disconnect the daemon before its reply arrives.
+  // Confirm the result; never fall back to killing a browser with unflushed state.
+  const deadline=now()+10000;
+  do{
+    const current=await info(config);
+    if(!current.open)return {closed:true,profileRetained:true};
+    if(!await samePath(current.profile,config.profile))throw fail('PROFILE_MISMATCH','The browser profile changed during shutdown. Inspect it before continuing.');
+    if(error&&error.code!=='BROWSER_ERROR'&&error.code!=='COMMAND_TIMEOUT')throw error;
+    await sleep(100);
+  }while(now()<deadline);
+  throw fail('BROWSER_CLOSE_PENDING','Chrome has not confirmed shutdown. Leave its profile intact and inspect the browser before retrying.');
 }
 
 export function parseResult(stdout) {

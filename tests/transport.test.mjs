@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
-import {settings,findCli,runCli,parseResult,act,sessionInfo,openBrowser} from '../scripts/transport.mjs';
+import {settings,findCli,runCli,parseResult,act,sessionInfo,openBrowser,closeBrowser} from '../scripts/transport.mjs';
 
 const scratch=fileURLToPath(new URL('../.work/transport-tests/',import.meta.url));
 await fs.mkdir(scratch,{recursive:true});
@@ -116,6 +116,28 @@ test('The actual pinned CLI launches the detected Chrome and reopens only its is
   const config=await isolated(t);
   process.env.WA_PLAYWRIGHT_CLI=require.resolve('@playwright/cli/playwright-cli.js');
   const open=()=>openBrowser(config,{url:'about:blank'});
+  const persistedStorage=async(page,_operation,{write=false}={})=>{
+    await page.route('https://transport.fixture.test/**',route=>route.fulfill({contentType:'text/html',body:'<title>Synthetic profile</title>'}));
+    await page.goto('https://transport.fixture.test/');
+    return page.evaluate(async write=>{
+      if(write)localStorage.setItem('fixture','synthetic-local-storage');
+      const database=await new Promise((resolve,reject)=>{
+        const request=indexedDB.open('fixture',1);
+        request.onupgradeneeded=()=>request.result.createObjectStore('state');
+        request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);
+      });
+      try{
+        const indexed=await new Promise((resolve,reject)=>{
+          const transaction=database.transaction('state',write?'readwrite':'readonly'),store=transaction.objectStore('state');
+          if(write)store.put('synthetic-indexed-db','fixture');
+          const request=store.get('fixture');
+          transaction.oncomplete=()=>resolve(request.result);
+          transaction.onabort=()=>reject(transaction.error);transaction.onerror=()=>reject(transaction.error);
+        });
+        return {local:localStorage.getItem('fixture'),indexed};
+      }finally{database.close();}
+    },write);
+  };
   try {
     await open();
     assert.equal((await sessionInfo(config)).profile,config.profile);
@@ -131,19 +153,39 @@ test('The actual pinned CLI launches the detected Chrome and reopens only its is
       await page.locator('textarea').fill(args.text);
       return await page.locator('textarea').inputValue();
     },'fixture',{text}),text);
+    const savedStorage={local:'synthetic-local-storage',indexed:'synthetic-indexed-db'};
+    assert.deepEqual(await act(config,persistedStorage,'fixture',{write:true}),savedStorage);
     await assert.rejects(runCli(config,['run-code','async () => { throw new Error("Synthetic backend failure"); }']),{code:'BROWSER_ERROR'});
-    await runCli(config,['close']);
+    await closeBrowser(config);
     assert.equal((await sessionInfo(config)).open,false);
     await open();
     assert.equal((await sessionInfo(config)).profile,config.profile);
     assert.equal((await sessionInfo(config)).headed,false);
     const cookies=await act(config,async page=>page.context().cookies('https://transport.fixture.test'),'fixture');
     assert.equal(cookies.find(cookie=>cookie.name==='fixture')?.value,cookieValue);
+    assert.deepEqual(await act(config,persistedStorage,'fixture'),savedStorage);
   } finally {
     // Close while fixture registry overrides are still active; test.after restores them.
-    await runCli(config,['close']);
+    await closeBrowser(config);
     assert.equal((await sessionInfo(config)).open,false);
   }
+});
+
+test('Shutdown refuses another profile and accepts a confirmed close after a disconnected reply',async t=>{
+  const config=await isolated(t);let requests=0;
+  const request=async()=>{requests++;throw Object.assign(Error('Session closed'),{code:'BROWSER_ERROR'});};
+  await assert.rejects(closeBrowser(config,{info:async()=>({open:true,profile:'unrelated'}),request}),{code:'PROFILE_MISMATCH'});
+  assert.equal(requests,0);
+  const states=[{open:true,profile:config.profile},{open:false}];
+  assert.deepEqual(await closeBrowser(config,{info:async()=>states.shift(),request}),{closed:true,profileRetained:true});
+  assert.equal(requests,1);
+});
+
+test('An unconfirmed shutdown never reports success or falls back to a forced close',async t=>{
+  const config=await isolated(t);let requests=0,clock=0;
+  await assert.rejects(closeBrowser(config,{info:async()=>({open:true,profile:config.profile}),
+    request:async()=>{requests++;},now:()=>clock,sleep:async()=>{clock+=10000;}}),{code:'BROWSER_CLOSE_PENDING'});
+  assert.equal(requests,1);
 });
 
 test('The discovered Chrome executable and visibility reach the backend without shell quoting or global settings',async t=>{

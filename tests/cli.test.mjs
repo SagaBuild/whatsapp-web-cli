@@ -19,6 +19,7 @@ async function fixture(){
   const browserAccess=()=>{state.browserCalls++;assert.equal(state.browserUnavailable,false,'Unexpected browser access');};
   const backend={settings:()=>config,findCli:async()=>{browserAccess();return '';},sessionInfo:async()=>{browserAccess();return {open:state.open,profile:state.profile,headed:state.headed};},snapshot:async()=>{browserAccess();return {snapshot:'fixture'};},
     openBrowser:async(c,{headed})=>{browserAccess();log.push({cli:['open','https://web.whatsapp.com/','--browser=chrome',...(headed?['--headed']:[]),`--profile=${c.profile}`]});},
+    closeBrowser:async()=>{browserAccess();log.push({cli:['close']});state.open=false;},
     runCli:async(c,args)=>{browserAccess();log.push({cli:args});return {stdout:args[0]==='tab-list'?'- 0: [WhatsApp](https://web.whatsapp.com/)\n- 1: (current) [Link](https://example.test/)':''};},
     act:async(c,fn,op,args)=>{
       browserAccess();
