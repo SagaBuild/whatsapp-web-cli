@@ -26,5 +26,7 @@ jobs:
       - name: Install Chrome for synthetic tests
         run: npx playwright install --with-deps chrome
       - name: Verify synthetic browser, installation and release checks
-        run: npm run verify
+        # This disposable runner contains synthetic fixtures only. Keep individual
+        # failures visible here; npm run verify stays path-free for users' machines.
+        run: npm test
       # Never upload account profiles, browser traces, screenshots or runtime artifacts.
